@@ -893,37 +893,75 @@ async function importQr(file) {
   } catch (e) { toast('导入失败：' + e.message); }
 }
 
+let knownUsers = {};
+let editingUser = '';
+
 async function loadUsers() {
   try {
     const d = await api('/api/users');
+    knownUsers = {};
     const box = $('users-list');
     box.innerHTML = '';
     (d.users || []).forEach((u) => {
+      knownUsers[u.username] = u;
       const row = document.createElement('div');
-      row.className = 'li';
+      row.className = 'li' + (u.username === editingUser ? ' sel' : '');
+      row.dataset.username = u.username;
       row.innerHTML =
         '<span class="grow"><span class="t">' + esc(u.display_name || u.username) +
         '</span><span class="s">' + esc(u.username) + ' · ' +
         (u.has_pin ? '已设 PIN' : '未设 PIN') + (u.is_active ? '' : ' · 已停用') +
         '</span></span>' +
         (u.role === 'ADMIN' ? '<span class="badge admin">管理员</span>' : '<span class="badge">员工</span>');
+      row.addEventListener('click', () => selectUser(u.username));
       box.appendChild(row);
     });
   } catch (_) { /* staff cannot list users */ }
 }
 
+function selectUser(username) {
+  const u = knownUsers[username];
+  if (!u) return;
+  editingUser = username;
+  $('new-username').value = u.username;
+  $('new-display').value = u.display_name || '';
+  $('new-pin').value = '';
+  $('new-role').value = u.role;
+  $('new-active').value = u.is_active ? '1' : '0';
+  document.querySelectorAll('#users-list .li').forEach((el) =>
+    el.classList.toggle('sel', el.dataset.username === username));
+}
+
+function clearUserForm() {
+  editingUser = '';
+  $('new-username').value = '';
+  $('new-display').value = '';
+  $('new-pin').value = '';
+  $('new-role').value = 'STAFF';
+  $('new-active').value = '1';
+  document.querySelectorAll('#users-list .li').forEach((el) => el.classList.remove('sel'));
+}
+
 async function saveUser() {
+  const username = $('new-username').value.trim();
+  const pin = $('new-pin').value.trim();
+  if (!username) { toast('请填账号'); return; }
+  if (pin && !/^\d{6,12}$/.test(pin)) { toast('PIN 必须是 6–12 位数字'); return; }
+  const isNew = !knownUsers[username];
+  if (isNew && !pin) { toast('新账号必须设置 PIN'); return; }
+  if (!isNew && pin && session && username === session.user.username &&
+      !window.confirm('你正在修改自己（当前登录管理员）的 PIN，改完下次登录要用新 PIN。确定修改？')) return;
   const body = {
-    username: $('new-username').value.trim(),
+    username,
     display_name: $('new-display').value.trim(),
-    pin: $('new-pin').value.trim(),
     role: $('new-role').value,
   };
-  if (!body.username) { toast('请填账号'); return; }
+  if (pin) body.pin = pin;
+  if (!isNew) body.is_active = $('new-active').value === '1' ? 1 : 0;
   try {
     await api('/api/users', { method: 'POST', body: JSON.stringify(body) });
-    $('new-pin').value = '';
-    toast('账号已保存');
+    toast(isNew ? '已新增账号 ' + username : '已更新账号 ' + username);
+    clearUserForm();
     loadUsers();
   } catch (e) { toast('保存账号失败：' + e.message); }
 }
@@ -2281,6 +2319,7 @@ function init() {
     } catch (e) { toast('移除失败：' + e.message); }
   };
   $('user-add').onclick = saveUser;
+  $('user-clear').onclick = clearUserForm;
 
   const saved = localStorage.getItem('pos2_session');
   if (saved) {
