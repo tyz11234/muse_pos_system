@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.db
+*.db-*
+.env
+pos2.env
+data/
+node_modules/
+android/
+ios/
+dist/
