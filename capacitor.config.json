@@ -3,7 +3,7 @@
   "appName": "CNKH POS 2.0",
   "webDir": "site",
   "server": {
-    "url": "http://43.156.169.203/pos2/",
+    "url": "http://43.156.169.203:88/",
     "cleartext": true
   }
 }
