@@ -96,3 +96,5 @@ jobs:
         with:
           name: cnkh-pos2-windows-exe
           path: desktop/dist/*.exe
+
+# signing rerun
