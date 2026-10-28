@@ -110,6 +110,8 @@ main{max-width:1240px; margin:0 auto; padding:14px}
 .badge.admin{background:#fdeef3; color:var(--brand)}
 .badge.low{background:#fdf0e0; color:var(--warn)}
 .list.compact .li{cursor:default}
+#users-list .li{cursor:pointer}
+#users-list .li.sel{outline:2px solid var(--brand2); background:#fdf3f6}
 
 /* settings */
 .settings-grid{display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:14px}
