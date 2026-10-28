@@ -1,0 +1,14 @@
+{
+  "name": "cnkh-pos2-shell",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Thin Capacitor shell for CNKH POS 2.0 - loads the server URL, all logic lives in the web app.",
+  "dependencies": {
+    "@capacitor/android": "^6.1.2",
+    "@capacitor/core": "^6.1.2",
+    "@capacitor/ios": "^6.1.2"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^6.1.2"
+  }
+}
