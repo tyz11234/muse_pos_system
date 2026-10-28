@@ -1,7 +1,7 @@
 // CNKH POS 2.0 desktop shell: a window on the server-hosted web app.
 const { app, BrowserWindow } = require('electron');
 
-const POS_URL = process.env.CNKH_POS_URL || 'http://43.156.169.203/pos2/';
+const POS_URL = process.env.CNKH_POS_URL || 'http://43.156.169.203:88/';
 
 function createWindow() {
   const win = new BrowserWindow({
