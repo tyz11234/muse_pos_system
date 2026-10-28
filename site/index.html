@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>CNKH POS 2.0</title>
-<link rel="stylesheet" href="assets/app.css?v=8">
+<link rel="stylesheet" href="assets/app.css?v=9">
 </head>
 <body>
 
@@ -469,8 +469,12 @@
       <div id="cash-round-note" class="hint"></div>
     </div>
     <div id="pay-qr" class="pay-pane hidden">
-      <div class="qr-amount pay-due">RM 0.00</div>
-      <div id="pay-qr-box" class="qr-box"></div>
+      <div class="qr-standee">
+        <div class="qs-band">DuitNow</div>
+        <div class="qs-name" id="pay-qr-name"></div>
+        <div id="pay-qr-box" class="qr-box"></div>
+        <div class="qr-amount pay-due">RM 0.00</div>
+      </div>
       <div id="pay-qr-note" class="hint center">请顾客扫码付款，付款后点确认收款。</div>
       <div id="pay-auto" class="pay-auto hidden"></div>
       <button id="qr-full-btn" class="btn big">全屏显示 QR</button>
@@ -488,8 +492,12 @@
         <button data-dm="DUITNOW" class="dmbtn">DuitNow</button>
       </div>
       <div id="credit-qr" class="hidden">
-        <div class="qr-amount" id="credit-qr-amt">RM 0.00</div>
-        <div id="credit-qr-box" class="qr-box"></div>
+        <div class="qr-standee">
+          <div class="qs-band">DuitNow</div>
+          <div class="qs-name" id="credit-qr-name"></div>
+          <div id="credit-qr-box" class="qr-box"></div>
+          <div class="qr-amount" id="credit-qr-amt">RM 0.00</div>
+        </div>
         <div id="credit-auto" class="pay-auto hidden"></div>
       </div>
       <div class="row"><span>记账欠款</span><b id="credit-due">RM 0.00</b></div>
@@ -681,10 +689,13 @@
 
 <!-- ======================= QR FULLSCREEN ======================= -->
 <div id="qr-full" class="qr-full hidden">
-  <div id="qr-full-shop" class="qr-full-shop"></div>
-  <div id="qr-full-amt" class="qr-full-amt"></div>
-  <div id="qr-full-box" class="qr-full-box"></div>
-  <div class="qr-full-note">请扫描付款 / Scan to pay</div>
+  <div class="qr-full-card">
+    <div class="qs-band">DuitNow</div>
+    <div id="qr-full-shop" class="qr-full-shop"></div>
+    <div id="qr-full-box" class="qr-full-box"></div>
+    <div id="qr-full-amt" class="qr-full-amt"></div>
+    <div class="qr-full-note">请扫描付款 / Scan to pay</div>
+  </div>
   <button id="qr-full-close" class="btn ghost big">关闭</button>
 </div>
 
@@ -724,6 +735,6 @@
 
 <script src="assets/qrcode.min.js?v=1"></script>
 <script src="assets/emv.js?v=1"></script>
-<script src="assets/app.js?v=17"></script>
+<script src="assets/app.js?v=18"></script>
 </body>
 </html>
