@@ -1,6 +1,6 @@
 {
   "appId": "com.cnkh.pos2",
-  "appName": "CNKH POS",
+  "appName": "CNKH POS 2.0",
   "webDir": "site",
   "server": {
     "url": "http://43.156.169.203/pos2/",
