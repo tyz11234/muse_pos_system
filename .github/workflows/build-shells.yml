@@ -1,0 +1,74 @@
+name: Build shells (APK / IPA / EXE)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'site/**'
+      - 'capacitor.config.json'
+      - 'package.json'
+      - 'desktop/**'
+      - '.github/workflows/build-shells.yml'
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '17' }
+      - run: npm install
+      - run: npx cap add android
+      - run: npx cap sync android
+      - name: Build debug APK
+        working-directory: android
+        run: ./gradlew assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cnkh-pos2-android-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+
+  ios:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - run: npm install
+      - run: npx cap add ios
+      - run: npx cap sync ios
+      - name: Build unsigned app
+        working-directory: ios/App
+        run: |
+          xcodebuild -project App.xcodeproj -scheme App -configuration Release \
+            -sdk iphoneos -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
+      - name: Package unsigned IPA
+        working-directory: ios/App
+        run: |
+          mkdir -p Payload
+          cp -r build/Build/Products/Release-iphoneos/App.app Payload/
+          zip -r cnkh-pos2-unsigned.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cnkh-pos2-ios-unsigned-ipa
+          path: ios/App/cnkh-pos2-unsigned.ipa
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - name: Build portable EXE
+        working-directory: desktop
+        run: |
+          npm install
+          npx electron-builder --win portable
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cnkh-pos2-windows-exe
+          path: desktop/dist/*.exe
