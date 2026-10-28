@@ -1,6 +1,6 @@
 {
   "name": "cnkh-pos2-shell",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
   "description": "Thin Capacitor shell for CNKH POS 2.0 - loads the server URL, all logic lives in the web app.",
   "dependencies": {
@@ -9,6 +9,7 @@
     "@capacitor/ios": "^6.1.2"
   },
   "devDependencies": {
-    "@capacitor/cli": "^6.1.2"
+    "@capacitor/cli": "^6.1.2",
+    "@capacitor/assets": "^3.0.5"
   }
 }
