@@ -1259,6 +1259,10 @@ async function loadBarcodeQueue() {
       });
       if (html) printLabelsHtml(html); else toast('队列是空的');
     };
+    $('bq-pdf').onclick = () => {
+      if (!(d.items || []).length) { toast('队列是空的'); return; }
+      exportLabelsPdf(d.items);
+    };
   } catch (e) { toast('载入条码队列失败：' + e.message); }
 }
 
@@ -2258,6 +2262,7 @@ function init() {
   $('imp-file').addEventListener('change', onImportFile);
   $('imp-confirm').onclick = doImportConfirm;
   $('imp-cancel').onclick = () => $('import-modal').classList.add('hidden');
+  $('prod-pdf').onclick = () => exportLabelsPdf(products);
   $('prod-gen-barcode').onclick = genProductBarcode;
   $('pin-modal-ok').onclick = () => {
     const pin = $('pin-modal-input').value.trim();
@@ -3783,6 +3788,97 @@ function printLabelsHtml(html) {
   $('print-area').innerHTML = html;
   window.print();
 }
+/* ---------------- barcode labels PDF (A4, 3 per row x 6 rows) ---------------- */
+function drawLabelCell(ctx, x, y, w, h, name, code) {
+  const svg = barcodeSvg(code);
+  if (!svg) return false;
+  const vb = /viewBox="0 0 (\d+(?:\.\d+)?)/.exec(svg);
+  const vbW = vb ? parseFloat(vb[1]) : 111;
+  const rects = [];
+  const re = /<rect x="(\d+(?:\.\d+)?)"[^>]*?width="(\d+(?:\.\d+)?)"/g;
+  let m;
+  while ((m = re.exec(svg))) rects.push([parseFloat(m[1]), parseFloat(m[2])]);
+  if (!rects.length) return false;
+  ctx.strokeStyle = '#000';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(x + 3, y + 3, w - 6, h - 6);
+  const barW = Math.min(w * 0.78, 300);
+  const barH = h * 0.34;
+  const blockH = barH + 14 + 36 + 8 + 36;
+  let cy = y + (h - blockH) / 2;
+  const bx = x + (w - barW) / 2;
+  const scale = barW / vbW;
+  ctx.fillStyle = '#000';
+  rects.forEach((r) => ctx.fillRect(bx + r[0] * scale, cy, Math.max(1, r[1] * scale), barH));
+  cy += barH + 14;
+  ctx.textAlign = 'center';
+  try { ctx.letterSpacing = '3px'; } catch (_) {}
+  ctx.font = '30px ui-monospace, Menlo, monospace';
+  ctx.fillText(code, x + w / 2, cy + 28);
+  try { ctx.letterSpacing = '0px'; } catch (_) {}
+  cy += 44;
+  let size = 31;
+  ctx.font = '700 ' + size + 'px sans-serif';
+  while (size > 18 && ctx.measureText(name).width > w - 24) {
+    size -= 2;
+    ctx.font = '700 ' + size + 'px sans-serif';
+  }
+  let label = name;
+  if (ctx.measureText(label).width > w - 24) {
+    while (label.length && ctx.measureText(label + '…').width > w - 24) label = label.slice(0, -1);
+    label += '…';
+  }
+  ctx.fillText(label, x + w / 2, cy + 28);
+  return true;
+}
+
+async function exportLabelsPdf(items) {
+  const cells = [];
+  let skipped = 0;
+  (items || []).forEach((it) => {
+    const code = String(it.barcode || '').trim();
+    if (!code || !barcodeSvg(code)) { skipped++; return; }
+    const n = Math.max(1, Math.min(200, parseInt(it.copies, 10) || 1));
+    for (let i = 0; i < n; i++) cells.push({ name: it.name || it.product_name || '', barcode: code });
+  });
+  if (!cells.length) { toast('没有可导出的条码'); return; }
+  const PW = 1240, PH = 1754, MX = 59, MY = 59, COLS = 3, ROWS = 6;
+  const cw = (PW - MX * 2) / COLS, ch = (PH - MY * 2) / ROWS;
+  const per = COLS * ROWS;
+  const canvases = [];
+  for (let p = 0; p * per < cells.length; p++) {
+    const cv = document.createElement('canvas');
+    cv.width = PW; cv.height = PH;
+    const ctx = cv.getContext('2d');
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, PW, PH);
+    ctx.fillStyle = '#000';
+    cells.slice(p * per, (p + 1) * per).forEach((cell, i) => {
+      drawLabelCell(ctx, MX + (i % COLS) * cw, MY + Math.floor(i / COLS) * ch,
+        cw, ch, cell.name, cell.barcode);
+    });
+    canvases.push(cv);
+  }
+  try {
+    const blob = await canvasesToPdfBlob(canvases);
+    const name = '条码标签_' + new Date().toISOString().slice(0, 10) + '.pdf';
+    const file = new File([blob], name, { type: 'application/pdf' });
+    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+      await navigator.share({ files: [file], text: name });
+    } else {
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = name;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    }
+    toast('已导出 PDF：' + cells.length + ' 张标签' +
+      (skipped ? '（跳过 ' + skipped + ' 个无条码商品）' : ''));
+  } catch (e) {
+    if (e && e.name !== 'AbortError') toast('导出失败：' + e.message);
+  }
+}
+
 function printProductLabel() {
   const name = $('prod-name').value.trim();
   const code = ($('prod-barcode').value.trim() || $('prod-sku').value.trim());
