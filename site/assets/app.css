@@ -110,6 +110,14 @@ main{max-width:1240px; margin:0 auto; padding:14px}
 .badge.admin{background:#fdeef3; color:var(--brand)}
 .badge.low{background:#fdf0e0; color:var(--warn)}
 .list.compact .li{cursor:default}
+.imp-preview{max-height:46vh; overflow:auto; margin:10px 0}
+.imp-preview table{width:100%; border-collapse:collapse; font-size:13px}
+.imp-preview th,.imp-preview td{border-bottom:1px solid var(--line); padding:5px 6px; text-align:left; white-space:nowrap}
+.imp-preview th{color:var(--mut); font-weight:600}
+.imp-tag{font-size:11px; padding:2px 7px; border-radius:999px; background:#eef1f5; color:var(--mut)}
+.imp-tag.gen{background:#fdf3d7; color:#92600a}
+.imp-tag.skip{background:#fde8e8; color:#b3002d}
+.imp-tag.warn{background:#fdeeda; color:#92600a}
 #users-list .li{cursor:pointer}
 #users-list .li.sel{outline:2px solid var(--brand2); background:#fdf3f6}
 
