@@ -1,0 +1,15 @@
+[Unit]
+Description=CNKH POS 2.0 (FastAPI, server-authoritative)
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/www/wwwroot/cnkh_pos2/server
+EnvironmentFile=/www/wwwroot/cnkh_pos2/pos2.env
+ExecStart=/www/wwwroot/cnkh_pos2/.venv/bin/python -m uvicorn main:app --host 0.0.0.0 --port 8091
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
