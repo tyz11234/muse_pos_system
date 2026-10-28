@@ -24,13 +24,32 @@ jobs:
       - run: npx cap add android
       - run: npx capacitor-assets generate --android
       - run: npx cap sync android
-      - name: Build debug APK
+      - name: Build APKs (debug + release)
         working-directory: android
-        run: ./gradlew assembleDebug
+        run: ./gradlew assembleDebug assembleRelease
+      - name: Sign release APK (if signing secrets are set)
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -z "$ANDROID_KEYSTORE_BASE64" ]; then echo "signing secrets not set - skipping"; exit 0; fi
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/cnkh-release.jks"
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          UNSIGNED=android/app/build/outputs/apk/release/app-release-unsigned.apk
+          "$BT/zipalign" -f -p 4 "$UNSIGNED" "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" sign --ks "$RUNNER_TEMP/cnkh-release.jks" --ks-pass env:STORE_PASS --ks-key-alias "$KEY_ALIAS" --key-pass env:KEY_PASS --out android/app/build/outputs/apk/release/app-release-signed.apk "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" verify --print-certs android/app/build/outputs/apk/release/app-release-signed.apk
       - uses: actions/upload-artifact@v4
         with:
           name: cnkh-pos2-android-debug-apk
           path: android/app/build/outputs/apk/debug/app-debug.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cnkh-pos2-android-release-apk
+          path: android/app/build/outputs/apk/release/app-release-signed.apk
+          if-no-files-found: ignore
 
   ios:
     runs-on: macos-14
