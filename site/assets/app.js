@@ -966,6 +966,146 @@ async function saveUser() {
   } catch (e) { toast('保存账号失败：' + e.message); }
 }
 
+/* ---------------- product import (Word / Excel / CSV) ---------------- */
+let importRows = [];
+
+function openImport() {
+  importRows = [];
+  $('imp-file').value = '';
+  $('imp-errors').innerHTML = '';
+  $('imp-preview').innerHTML = '';
+  $('imp-confirm').disabled = true;
+  $('import-modal').classList.remove('hidden');
+}
+
+async function fileToB64(file) {
+  const buf = await file.arrayBuffer();
+  const bytes = new Uint8Array(buf);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(bin);
+}
+
+const IMP_STATUS = {
+  ok: ['', ''],
+  generate: ['gen', '自动生成条码'],
+  exists: ['skip', '已存在·跳过'],
+  dup_file: ['skip', '文件内重复·跳过'],
+  bad_checksum: ['warn', '条码校验位异常'],
+};
+
+function renderImportPreview(d) {
+  const errs = (d.warnings || []).concat(d.errors || []);
+  $('imp-errors').innerHTML = errs.map((e) => '<div>⚠️ ' + esc(e) + '</div>').join('');
+  if (!importRows.length) {
+    $('imp-preview').innerHTML = '<p class="hint">没有可导入的商品行。</p>';
+    return;
+  }
+  let h = '<table><tr><th>名称</th><th>售价</th><th>成本</th><th>库存</th><th>条码</th><th>分类</th><th></th></tr>';
+  importRows.forEach((r) => {
+    const st = IMP_STATUS[r._status] || IMP_STATUS.ok;
+    h += '<tr><td>' + esc(r.name) + '</td><td>' + fmt(r.price_cents) + '</td><td>' +
+      fmt(r.cost_cents) + '</td><td>' + r.stock_qty + '</td><td>' +
+      esc(r.barcode || '—') + '</td><td>' + esc(r.category_name || '') + '</td>' +
+      (st[1] ? '<td><span class="imp-tag ' + st[0] + '">' + st[1] + '</span></td>' : '<td></td>') + '</tr>';
+  });
+  $('imp-preview').innerHTML = h + '</table>';
+  $('imp-confirm').disabled = false;
+  $('imp-confirm').textContent = '确认导入 ' + importRows.length + ' 条';
+}
+
+async function onImportFile() {
+  const file = $('imp-file').files && $('imp-file').files[0];
+  if (!file) return;
+  if (file.size > 10 * 1024 * 1024) { toast('文件不能超过 10MB'); return; }
+  $('imp-errors').innerHTML = '正在解析…';
+  $('imp-preview').innerHTML = '';
+  $('imp-confirm').disabled = true;
+  try {
+    const data_b64 = await fileToB64(file);
+    const d = await api('/api/products/import/preview', {
+      method: 'POST',
+      body: JSON.stringify({ filename: file.name, data_b64 }),
+    });
+    importRows = d.rows || [];
+    renderImportPreview(d);
+    if (importRows.length) toast('解析出 ' + importRows.length + ' 条商品，请核对后确认导入');
+  } catch (e) {
+    $('imp-errors').innerHTML = '';
+    importRows = [];
+    toast('解析失败：' + e.message);
+  }
+}
+
+async function doImportConfirm() {
+  if (!importRows.length) return;
+  $('imp-confirm').disabled = true;
+  try {
+    const d = await api('/api/products/import/confirm', {
+      method: 'POST',
+      body: JSON.stringify({ rows: importRows }),
+    });
+    let h = '<p><b>✅ 已导入 ' + d.created_count + ' 条</b></p>';
+    (d.created || []).forEach((c) => {
+      h += '<div>' + esc(c.name) + ' · 条码 ' + esc(c.barcode) +
+        (c.generated ? ' <span class="imp-tag gen">自动生成</span>' : '') + '</div>';
+    });
+    if (d.skipped_count) {
+      h += '<p><b>跳过 ' + d.skipped_count + ' 条</b></p>';
+      (d.skipped || []).forEach((s) => {
+        h += '<div>' + esc(s.name) + '：' + esc(s.reason) + '</div>';
+      });
+    }
+    $('imp-preview').innerHTML = h;
+    importRows = [];
+    toast('导入完成：' + d.created_count + ' 条');
+    await loadCatalog();
+    renderProducts();
+  } catch (e) {
+    $('imp-confirm').disabled = false;
+    toast('导入失败：' + e.message);
+  }
+}
+
+/* ---------------- admin PIN confirm + barcode generation ---------------- */
+let pinModalCb = null;
+
+function askAdminPin(msg, cb) {
+  pinModalCb = cb;
+  $('pin-modal-msg').textContent = msg;
+  $('pin-modal-input').value = '';
+  $('pin-modal').classList.remove('hidden');
+  setTimeout(() => { try { $('pin-modal-input').focus(); } catch (_) {} }, 60);
+}
+
+function closePinModal() {
+  pinModalCb = null;
+  $('pin-modal').classList.add('hidden');
+}
+
+async function genProductBarcode() {
+  const id = $('prod-id').value;
+  if (!id) { toast('请先保存商品，再生成条码'); return; }
+  const old = $('prod-barcode').value.trim();
+  if (old && !window.confirm('该商品已有条码 ' + old + '。\n生成新条码后，旧条码立即停用，扫旧码将找不到此商品。\n确定生成新条码？')) return;
+  askAdminPin(old
+    ? '为商品生成新条码（旧条码将停用），请输入管理员 PIN 确认'
+    : '为商品自动生成条码，请输入管理员 PIN 确认', async (pin) => {
+    try {
+      const d = await api('/api/products/' + id + '/barcode', {
+        method: 'POST', body: JSON.stringify({ pin }),
+      });
+      $('prod-barcode').value = d.barcode;
+      toast(d.old_barcode
+        ? '已生成新条码 ' + d.barcode + '（旧条码已停用）'
+        : '已生成条码 ' + d.barcode);
+      loadCatalog();
+    } catch (e) { toast('生成失败：' + e.message); }
+  });
+}
+
 /* ---------------- wiring ---------------- */
 /* ---------------- data export ------------------------------------------ */
 async function downloadApi(path, filename) {
@@ -2114,6 +2254,22 @@ function init() {
   });
   $('prod-search').addEventListener('input', renderProducts);
   $('prod-add').onclick = () => openProduct(null);
+  $('prod-import').onclick = openImport;
+  $('imp-file').addEventListener('change', onImportFile);
+  $('imp-confirm').onclick = doImportConfirm;
+  $('imp-cancel').onclick = () => $('import-modal').classList.add('hidden');
+  $('prod-gen-barcode').onclick = genProductBarcode;
+  $('pin-modal-ok').onclick = () => {
+    const pin = $('pin-modal-input').value.trim();
+    if (!pin) { toast('请输入管理员 PIN'); return; }
+    const cb = pinModalCb;
+    closePinModal();
+    if (cb) cb(pin);
+  };
+  $('pin-modal-cancel').onclick = closePinModal;
+  $('pin-modal-input').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') $('pin-modal-ok').click();
+  });
   $('prod-save').onclick = saveProduct;
   const pdBtn = $('prod-del');
   if (pdBtn) pdBtn.onclick = async () => {
