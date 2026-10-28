@@ -190,7 +190,7 @@ main{max-width:1240px; margin:0 auto; padding:14px}
 #print-area{display:none}
 @media print{
   body>*{display:none !important}
-  #print-area{display:block !important; width:80mm; font-family:ui-monospace,Menlo,monospace;
+  #print-area{display:block !important; width:80mm; margin:0 auto; font-family:ui-monospace,Menlo,monospace;
     font-size:12px; color:#000; padding:2mm}
   #print-area .c{text-align:center}
   #print-area .big{font-size:16px; font-weight:700}
@@ -200,8 +200,9 @@ main{max-width:1240px; margin:0 auto; padding:14px}
   #print-area .label{border:1px solid #000; padding:2mm; margin-bottom:2mm; text-align:center}
   #print-area .label .lname{font-size:12px; font-weight:700}
   #print-area .label .lprice{font-size:18px; font-weight:700}
-  #print-area .label svg{width:44mm; height:12mm}
-  #print-area .label .lcode{font-size:10px; letter-spacing:2px}
+  #print-area .label svg{width:44mm; height:12mm; display:block; margin:0 auto}
+  #print-area .label .lcode{font-size:10px; letter-spacing:2px; text-indent:2px}
+  #print-area .label .lname{text-indent:0}
 }
 
 /* wave-2: hub, dashboard, stocktake, audit, training, labels */
