@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>CNKH POS 2.0</title>
-<link rel="stylesheet" href="assets/app.css?v=9">
+<link rel="stylesheet" href="assets/app.css?v=10">
 </head>
 <body>
 
@@ -217,9 +217,11 @@
           <input id="new-display" type="text" placeholder="显示名">
           <input id="new-pin" type="password" inputmode="numeric" placeholder="PIN（6–12位数字）" maxlength="12">
           <select id="new-role"><option value="STAFF">员工</option><option value="ADMIN">管理员</option></select>
+          <select id="new-active"><option value="1">状态：启用</option><option value="0">状态：停用</option></select>
           <button id="user-add" class="btn primary">新增 / 更新</button>
+          <button id="user-clear" class="btn">清空表单（新建）</button>
         </div>
-        <div class="hint">填已有账号 + 新 PIN 即为该账号重设 PIN。</div>
+        <div class="hint">点上方账号即可选取编辑：可改显示名、角色、启用/停用，或填新 PIN 重设密码（PIN 留空 = 不改密码）。新建账号必须设 PIN。</div>
       </div>
     </section>
 
@@ -735,6 +737,6 @@
 
 <script src="assets/qrcode.min.js?v=1"></script>
 <script src="assets/emv.js?v=1"></script>
-<script src="assets/app.js?v=18"></script>
+<script src="assets/app.js?v=19"></script>
 </body>
 </html>
