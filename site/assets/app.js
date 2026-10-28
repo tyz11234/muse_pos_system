@@ -424,6 +424,7 @@ function showPayPane() {
     updateChange();
   }
   if (payMethod === 'DUITNOW') {
+    $('pay-qr-name').textContent = settings.store_name || '';
     const box = $('pay-qr-box');
     const payload = (settings.duitnow_qr_payload || '').trim();
     if (total <= 0) {
@@ -2647,6 +2648,7 @@ function renderCreditQr() {
   const show = payMethod === 'CREDIT' && depositMethod === 'DUITNOW' && dep > 0;
   $('credit-qr').classList.toggle('hidden', !show);
   if (!show) return;
+  $('credit-qr-name').textContent = settings.store_name || '';
   $('credit-qr-amt').textContent = fmt(dep);
   const payload = (settings.duitnow_qr_payload || '').trim();
   $('credit-qr-box').innerHTML =
