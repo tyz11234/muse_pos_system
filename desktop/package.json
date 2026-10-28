@@ -1,0 +1,19 @@
+{
+  "name": "cnkh-pos2-desktop",
+  "version": "1.0.0",
+  "private": true,
+  "main": "main.js",
+  "scripts": {
+    "build": "electron-builder --win portable"
+  },
+  "devDependencies": {
+    "electron": "^31.3.0",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "com.cnkh.pos2.desktop",
+    "productName": "CNKH POS",
+    "files": ["main.js"],
+    "win": { "target": "portable" }
+  }
+}
