@@ -1,0 +1,729 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>CNKH POS 2.0</title>
+<link rel="stylesheet" href="assets/app.css?v=8">
+</head>
+<body>
+
+<!-- ======================= LOGIN ======================= -->
+<div id="view-login" class="login-wrap">
+  <div class="login-card">
+    <div class="login-logo">CNKH POS</div>
+    <div class="login-sub" id="login-store-name">收银系统 2.0</div>
+    <div id="login-users" class="login-users"></div>
+    <input id="login-pin" type="password" inputmode="numeric" autocomplete="off"
+           placeholder="输入 PIN" maxlength="12">
+    <button id="login-btn" class="btn primary big">登 录</button>
+    <div id="login-error" class="error-text"></div>
+  </div>
+</div>
+
+<!-- ======================= APP ======================= -->
+<div id="view-app" class="hidden">
+  <header class="topbar">
+    <div class="topbar-left">
+      <span class="brand">CNKH POS</span>
+      <span id="top-store" class="top-store"></span>
+      <span id="train-badge" class="train-badge hidden">训练中</span>
+    </div>
+    <div class="topbar-right">
+      <span id="pay-dot" class="pay-dot off" title="到账播报状态"></span>
+      <span id="top-user" class="top-user"></span>
+      <button id="logout-btn" class="btn ghost small">退出</button>
+    </div>
+  </header>
+
+  <nav class="tabbar">
+    <button data-tab="pos" class="tab active">收银</button>
+    <button data-tab="today" class="tab">今日</button>
+    <button data-tab="hub" class="tab" id="tabbtn-hub">管理</button>
+    <button data-tab="settings" class="tab">设置</button>
+  </nav>
+
+  <main>
+    <!-- POS -->
+    <section id="tab-pos" class="tabpage">
+      <div class="pos-layout">
+        <div class="pos-left">
+          <div class="pos-tools">
+            <input id="pos-search" type="search" placeholder="搜索商品 / 条码">
+            <button id="scan-btn" class="btn">📷 扫码加购</button>
+            <div id="pos-cats" class="chips"></div>
+          </div>
+          <div id="pos-grid" class="product-grid"></div>
+        </div>
+        <aside class="cart">
+          <div class="cart-head">购物车 <span id="cart-count"></span></div>
+          <div id="cart-items" class="cart-items"></div>
+          <div class="cart-foot">
+            <div class="row"><span>小计</span><b id="cart-subtotal">RM 0.00</b></div>
+            <div class="row hidden" id="cart-linedisc-row"><span>行折扣</span><b id="cart-linedisc">−RM 0.00</b></div>
+            <div class="row"><span>整单折扣</span>
+              <input id="cart-discount" type="number" min="0" step="0.10" value="0" class="money-input">
+            </div>
+            <div class="row hidden" id="cart-round-row"><span>5仙舍入</span><b id="cart-rounding"></b></div>
+            <div class="row total"><span>应付</span><b id="cart-total">RM 0.00</b></div>
+            <div class="cart-actions">
+              <button id="hold-btn" class="btn">挂单</button>
+              <button id="held-btn" class="btn">取单 <span id="held-count"></span></button>
+            </div>
+            <button id="checkout-btn" class="btn primary big" disabled>结 账</button>
+          </div>
+        </aside>
+      </div>
+    </section>
+
+    <!-- TODAY -->
+    <section id="tab-today" class="tabpage hidden">
+      <div class="page-tools">
+        <span id="today-summary" class="summary-text"></span>
+        <button id="today-refresh" class="btn">刷新</button>
+      </div>
+      <div id="today-list" class="list"></div>
+    </section>
+
+    <!-- ADMIN HUB -->
+    <section id="tab-hub" class="tabpage hidden">
+      <div id="hub-menu" class="hub-grid">
+        <button data-hub="dashboard">🏠 主页 Dashboard</button>
+        <button data-hub="products">📦 商品 Products</button>
+        <button data-hub="categories">🗂 分类 Categories</button>
+        <button data-hub="barcode">🏷 条码队列 Barcode Queue</button>
+        <button data-hub="sales">🧾 销售 Sales</button>
+        <button data-hub="payments">💰 收款记录 Payments</button>
+        <button data-hub="customers">👥 客户 Customers</button>
+        <button data-hub="suppliers">🏭 供应商 Suppliers</button>
+        <button data-hub="purchases">🚚 进货 Purchases</button>
+        <button data-hub="stocktake">📋 盘点 Stocktake</button>
+        <button data-hub="users">👤 员工 Users</button>
+        <button data-hub="reports">📊 报表 Reports</button>
+        <button data-hub="closings">🌙 日结 Daily Close</button>
+        <button data-hub="maintenance">🛠 维护 Maintenance</button>
+        <button data-hub="audit">🔍 折扣审计 Audit</button>
+      </div>
+      <p class="hint">条码标签硬件打印、Windows 备份/还原请在桌面端操作（手机/网页端可导标签图）。</p>
+    </section>
+
+    <!-- DASHBOARD -->
+    <section id="tab-dashboard" class="tabpage hidden">
+      <button class="btn small hub-back">← 管理中心</button>
+      <h3 class="sec-title">今日主页</h3>
+      <div id="dash-cards" class="summary-cards"></div>
+    </section>
+
+    <!-- CATEGORIES -->
+    <section id="tab-categories" class="tabpage hidden">
+      <button class="btn small hub-back">← 管理中心</button>
+      <div class="page-tools">
+        <input id="cat-new-name" type="text" placeholder="新分类名称">
+        <button id="cat-create" class="btn primary">+ 新增分类</button>
+      </div>
+      <div id="cat-list" class="list"></div>
+    </section>
+
+    <!-- BARCODE QUEUE -->
+    <section id="tab-barcode" class="tabpage hidden">
+      <button class="btn small hub-back">← 管理中心</button>
+      <div class="page-tools">
+        <span class="summary-text">待打印标签队列（在商品页把商品加入队列）</span>
+        <button id="bq-print-all" class="btn primary">打印全部标签</button>
+      </div>
+      <div id="bq-list" class="list"></div>
+    </section>
+
+    <!-- STOCKTAKE -->
+    <section id="tab-stocktake" class="tabpage hidden">
+      <button class="btn small hub-back">← 管理中心</button>
+      <div class="page-tools">
+        <input id="stk-search" type="search" placeholder="搜索商品盘点">
+      </div>
+      <div id="stk-list" class="list"></div>
+    </section>
+
+    <!-- PRODUCTS -->
+    <section id="tab-products" class="tabpage hidden">
+      <button class="btn small hub-back">← 管理中心</button>
+      <div class="page-tools">
+        <input id="prod-search" type="search" placeholder="搜索商品">
+        <button id="prod-add" class="btn primary">+ 新增商品</button>
+        <button id="cat-add" class="btn">+ 分类</button>
+      </div>
+      <div id="prod-list" class="list"></div>
+    </section>
+
+    <!-- SALES -->
+    <section id="tab-sales" class="tabpage hidden">
+      <button class="btn small hub-back">← 管理中心</button>
+      <div class="page-tools">
+        <input id="sales-q" type="search" placeholder="搜索单号 / 手机 / 客户">
+        <label>从 <input id="sales-from" type="date"></label>
+        <label>到 <input id="sales-to" type="date"></label>
+        <button id="sales-clear" class="btn">清除</button>
+      </div>
+      <div class="page-tools">
+        <span id="sales-summary" class="summary-text"></span>
+      </div>
+      <div id="sales-list" class="list"></div>
+      <div class="page-tools pager">
+        <button id="sales-prev" class="btn">上一页</button>
+        <span id="sales-page" class="summary-text"></span>
+        <button id="sales-next" class="btn">下一页</button>
+      </div>
+    </section>
+
+    <!-- REPORTS -->
+    <section id="tab-reports" class="tabpage hidden">
+      <button class="btn small hub-back">← 管理中心</button>
+      <div class="page-tools">
+        <div class="chips" id="rep-chips">
+          <button data-range="today" class="sel">今日</button>
+          <button data-range="week">本周</button>
+          <button data-range="month">本月</button>
+        </div>
+      </div>
+      <div class="summary-cards" id="rep-summary"></div>
+      <div class="two-col">
+        <div id="rep-methods" class="list compact"></div>
+        <div id="rep-top" class="list compact"></div>
+      </div>
+      <h3 class="sec-title">月报（按月整理）</h3>
+      <div class="page-tools">
+        <input id="mr-month" type="month">
+        <button id="mr-pdf" class="btn primary">📄 导出 PDF</button>
+      </div>
+      <div id="mr-body"><div class="cart-empty">载入中…</div></div>
+    </section>
+
+    <!-- CLOSINGS -->
+    <section id="tab-closings" class="tabpage hidden">
+      <button class="btn small hub-back">← 管理中心</button>
+      <div class="page-tools">
+        <button id="closing-btn" class="btn primary">做日结 / 查看历史</button>
+      </div>
+      <p class="hint">日结时系统现金由服务器按当日销售权威重算（现金单 + 现金定金 + 当日还款），不采信手填数字。</p>
+    </section>
+
+    <!-- USERS -->
+    <section id="tab-users" class="tabpage hidden">
+      <button class="btn small hub-back">← 管理中心</button>
+      <div class="card" id="users-card">
+        <h3>账号管理</h3>
+        <div id="users-list" class="list compact"></div>
+        <div class="user-form">
+          <input id="new-username" type="text" placeholder="账号">
+          <input id="new-display" type="text" placeholder="显示名">
+          <input id="new-pin" type="password" inputmode="numeric" placeholder="PIN（6–12位数字）" maxlength="12">
+          <select id="new-role"><option value="STAFF">员工</option><option value="ADMIN">管理员</option></select>
+          <button id="user-add" class="btn primary">新增 / 更新</button>
+        </div>
+        <div class="hint">填已有账号 + 新 PIN 即为该账号重设 PIN。</div>
+      </div>
+    </section>
+
+    <!-- MAINTENANCE -->
+    <section id="tab-maintenance" class="tabpage hidden">
+      <button class="btn small hub-back">← 管理中心</button>
+      <div class="card">
+        <h3>清空交易数据</h3>
+        <p class="hint">删除销售、挂单、进货、库存流水、日结；商品 / 客户 / 供应商 / 设置 / 账号保留。先点「计算影响」看数量再执行。</p>
+        <button id="wipe-txn-btn" class="btn danger">清空交易数据…</button>
+      </div>
+      <div class="card">
+        <h3>开业清零（勾选）</h3>
+        <div id="wipe-cats" class="wipe-cats"></div>
+        <div class="row gap">
+          <button id="wipe-dry" class="btn">计算影响</button>
+          <button id="wipe-run" class="btn danger">执行清零</button>
+        </div>
+        <div id="wipe-result" class="hint"></div>
+        <p class="hint">账号永不清零。收款账本清零会经银行邮件流水线服务执行，并留标记防止旧记录被回扫复活。</p>
+      </div>
+    </section>
+
+    <!-- AUDIT -->
+    <section id="tab-audit" class="tabpage hidden">
+      <button class="btn small hub-back">← 管理中心</button>
+      <div class="page-tools">
+        <label class="check-row"><input id="audit-today" type="checkbox" checked> 仅今日</label>
+        <input id="audit-user" type="search" placeholder="按用户名筛选">
+        <button id="audit-refresh" class="btn">刷新</button>
+      </div>
+      <div id="audit-list" class="list"></div>
+    </section>
+
+    <!-- TRAINING -->
+    <section id="tab-training" class="tabpage hidden">
+      <button class="btn small" id="training-back">← 返回设置</button>
+      <h3 class="sec-title">员工培训（11 课）</h3>
+      <div id="training-lessons"></div>
+    </section>
+
+    <!-- E-INVOICE STATUS -->
+    <section id="tab-einvoice" class="tabpage hidden">
+      <button class="btn small" id="einvoice-back">← 返回设置</button>
+      <div class="page-tools">
+        <label>环境 <select id="einvoice-env">
+          <option value="production">正式 Production</option>
+          <option value="sandbox">测试 Sandbox</option>
+        </select></label>
+        <button id="einvoice-refresh" class="btn">刷新</button>
+      </div>
+      <p class="hint">离线/网页端销售先显示 Pending；提交 MyInvois 需要在服务器配置凭证后由系统提交，此页只读镜像状态。</p>
+      <div id="einvoice-list" class="list"></div>
+    </section>
+
+    <!-- PAYMENTS -->
+    <section id="tab-payments" class="tabpage hidden">
+      <button class="btn small hub-back">← 管理中心</button>
+      <div class="summary-cards" id="pay-summary"></div>
+      <div id="payments-list" class="list"></div>
+    </section>
+
+    <!-- CUSTOMERS -->
+    <section id="tab-customers" class="tabpage hidden">
+      <button class="btn small hub-back">← 管理中心</button>
+      <div class="page-tools">
+        <input id="cust-search" type="search" placeholder="搜索客户">
+        <button id="cust-add" class="btn primary">+ 新增客户</button>
+      </div>
+      <div id="cust-list" class="list"></div>
+      <h3 class="sec-title">未结清赊账</h3>
+      <div id="credit-list" class="list"></div>
+    </section>
+
+    <!-- PURCHASES -->
+    <section id="tab-purchases" class="tabpage hidden">
+      <button class="btn small hub-back">← 管理中心</button>
+      <div class="page-tools">
+        <button id="pur-add" class="btn primary">+ 新建采购</button>
+        <button id="sup-add" class="btn">+ 供应商</button>
+        <button id="pur-alias-btn" class="btn">供应商商品记忆</button>
+      </div>
+      <h3 class="sec-title">未完成 OCR 草稿 <span id="draft-count"></span></h3>
+      <div id="draft-list" class="list"></div>
+      <h3 class="sec-title">采购记录</h3>
+      <div id="pur-list" class="list"></div>
+    </section>
+
+    <!-- SUPPLIERS -->
+    <section id="tab-suppliers" class="tabpage hidden">
+      <button class="btn small hub-back">← 管理中心</button>
+      <div class="page-tools">
+        <input id="sup-search" type="search" placeholder="搜索供应商">
+        <button id="sup-add2" class="btn primary">+ 新增供应商</button>
+      </div>
+      <div id="sup-rows" class="list"></div>
+      <p class="hint">删除是软删除：历史进货记录仍保留当时的供应商名称，不受影响。</p>
+    </section>
+
+    <!-- PURCHASE DRAFT REVIEW -->
+    <section id="tab-draft" class="tabpage hidden">
+      <button class="btn small" id="draft-back">← 返回进货</button>
+      <h3 class="sec-title">OCR 草稿核对</h3>
+      <div class="card">
+        <label>供应商 <select id="draft-supplier"></select></label>
+        <div class="two">
+          <label>进货单号 <input id="draft-invoice" type="text"></label>
+          <label>发票日期 <input id="draft-date" type="date"></label>
+        </div>
+        <div class="two">
+          <label>折扣 Discount RM <input id="draft-fee-discount" type="number" min="0" step="0.10" value="0"></label>
+          <label>SST / Tax RM <input id="draft-fee-tax" type="number" min="0" step="0.10" value="0"></label>
+        </div>
+        <div class="two">
+          <label>运费 Delivery RM <input id="draft-fee-delivery" type="number" min="0" step="0.10" value="0"></label>
+          <label>其他 Other RM <input id="draft-fee-other" type="number" min="0" step="0.10" value="0"></label>
+        </div>
+        <div class="row"><span>计算总计</span><b id="draft-calc-total">RM 0.00</b></div>
+        <div class="row"><span>发票总计</span><b id="draft-inv-total">—</b></div>
+        <label class="check-row"><input id="draft-only-issues" type="checkbox"> 只看异常</label>
+      </div>
+      <div id="draft-errors" class="error-text"></div>
+      <div id="draft-warnings" class="warn-text"></div>
+      <div id="draft-lines"></div>
+      <button id="draft-line-add" class="btn">＋ 加一行</button>
+      <details>
+        <summary>OCR 原文</summary>
+        <pre id="draft-raw" class="ocr-raw"></pre>
+      </details>
+      <div class="row gap wrap">
+        <button id="draft-save" class="btn">保存草稿</button>
+        <button id="draft-commit" class="btn primary">确认入库</button>
+        <button id="draft-delete" class="btn danger">删除草稿</button>
+      </div>
+    </section>
+
+    <!-- SUPPLIER ALIASES -->
+    <section id="tab-aliases" class="tabpage hidden">
+      <button class="btn small hub-back">← 管理中心</button>
+      <div class="page-tools">
+        <label>供应商 <select id="alias-supplier"></select></label>
+      </div>
+      <p class="hint">OCR 入库时自动学习的「供应商发票品名 → 本店商品」记忆，含单位换算（如 1 箱 = 24 件）。</p>
+      <div id="alias-list" class="list"></div>
+    </section>
+
+    <!-- SETTINGS -->
+    <section id="tab-settings" class="tabpage hidden">
+      <div class="settings-grid">
+        <div class="card">
+          <h3>小票格式（80mm 实时预览）</h3>
+          <label>店名 <input id="set-store-name" type="text"></label>
+          <label>地址 <textarea id="set-store-address" rows="2"></textarea></label>
+          <label>电话 <input id="set-store-phone" type="text"></label>
+          <label>页眉（每行居中） <textarea id="set-receipt-header" rows="2"></textarea></label>
+          <label>页脚 <textarea id="set-receipt-footer" rows="2"></textarea></label>
+          <label>备注 <textarea id="set-receipt-notes" rows="2"></textarea></label>
+          <label>字符宽度（24–64，80mm ≈ 40） <input id="set-receipt-width" type="number" min="24" max="64"></label>
+          <div class="toggle-grid">
+            <label class="check-row"><input id="set-show-sku" type="checkbox"> 显示 SKU</label>
+            <label class="check-row"><input id="set-show-cashier" type="checkbox"> 显示收银员</label>
+            <label class="check-row"><input id="set-show-datetime" type="checkbox"> 显示日期时间</label>
+            <label class="check-row"><input id="set-show-payment" type="checkbox"> 显示付款方式</label>
+            <label class="check-row"><input id="set-show-change" type="checkbox"> 显示找零</label>
+            <label class="check-row"><input id="set-show-discount" type="checkbox"> 显示折扣行</label>
+            <label class="check-row"><input id="set-show-unit-price" type="checkbox"> 显示单价</label>
+            <label class="check-row"><input id="set-show-qty" type="checkbox"> 显示数量</label>
+            <label class="check-row"><input id="set-show-qr" type="checkbox"> 小票附 DuitNow QR</label>
+          </div>
+          <div id="receipt-preview" class="receipt-preview"></div>
+        </div>
+        <div class="card">
+          <h3>运营设置</h3>
+          <label>库存不足策略
+            <select id="set-stock-policy">
+              <option value="warn">提醒后可继续（warn）</option>
+              <option value="block">禁止超卖（block）</option>
+            </select></label>
+          <label>挂单超时提醒（分钟） <input id="set-hold-timeout" type="number" min="0"></label>
+          <label>扫码反馈
+            <select id="set-scan-feedback">
+              <option value="beep">提示音</option>
+              <option value="vibrate">震动</option>
+              <option value="mute">静音</option>
+            </select></label>
+          <label>缺货提醒阈值 <input id="set-low-stock" type="number" min="0"></label>
+          <label class="check-row"><input id="set-images-enabled" type="checkbox"> 商品图片（总开关）</label>
+          <label class="check-row"><input id="set-bt-enabled" type="checkbox"> 蓝牙小票机（打包 App 后生效；网页版用系统打印）</label>
+          <label class="check-row"><input id="set-training" type="checkbox"> 训练模式（练习结账：不扣库存、不计营业额、不产生欠款）</label>
+          <button id="set-save" class="btn primary">保存设置</button>
+          <div class="hint">设置保存在服务器，所有设备打开即一致。员工只能查看，不能修改。</div>
+        </div>
+        <div class="card">
+          <h3>DuitNow 收款码</h3>
+          <div id="qr-status" class="qr-status">未设置</div>
+          <div id="qr-preview" class="qr-preview"></div>
+          <input id="qr-file" type="file" accept="image/*" class="hidden">
+          <button id="qr-import" class="btn primary">导入收款码图片</button>
+          <button id="qr-clear" class="btn danger hidden">移除</button>
+          <div class="hint">导入后，结账选 DuitNow 时自动生成金额锁定的动态码。</div>
+        </div>
+        <div class="card hidden" id="export-card">
+          <h3>数据导出</h3>
+          <div class="row gap wrap">
+            <button class="btn btn-ghost" id="exp-sales">销售 CSV</button>
+            <button class="btn btn-ghost" id="exp-products">商品 CSV</button>
+            <button class="btn btn-ghost" id="exp-payments">收款 CSV</button>
+            <button class="btn btn-ghost" id="exp-backup">全量备份 JSON</button>
+          </div>
+          <p class="muted small">导出本月销售 CSV，其余为全部数据。备份不含登录 PIN。</p>
+        </div>
+
+        <div class="card">
+          <h3>更多</h3>
+          <button id="goto-training" class="btn big">🎓 员工培训（11 课）</button>
+          <button id="goto-einvoice" class="btn big">🧾 e-Invoice 状态</button>
+          <div class="hint">账号管理在「管理 → 员工」；数据清零在「管理 → 维护」。</div>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<!-- ======================= CHECKOUT MODAL ======================= -->
+<div id="checkout-modal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-head"><span>结账</span><button class="modal-x" data-close="checkout-modal">✕</button></div>
+    <div class="pay-methods">
+      <button data-method="CASH" class="pm active">现金</button>
+      <button data-method="DUITNOW" class="pm">DuitNow QR</button>
+      <button data-method="CARD" class="pm">刷卡</button>
+      <button data-method="CREDIT" class="pm">赊账</button>
+    </div>
+    <div class="co-customer">
+      <label>客户（赊账必选；电子收据可选）<select id="co-customer"></select></label>
+      <label>手机号（电子收据）<input id="co-phone" type="tel" placeholder="01x-xxx xxxx"></label>
+      <div id="co-outstanding" class="error-text"></div>
+    </div>
+    <div id="pay-cash" class="pay-pane">
+      <div class="row total"><span>应付</span><b class="pay-due">RM 0.00</b></div>
+      <label>收款金额 <input id="pay-paid" type="number" min="0" step="0.10" class="money-input wide"></label>
+      <div class="quick-cash">
+        <button data-amt="exact">刚刚好</button><button data-amt="10">10</button>
+        <button data-amt="20">20</button><button data-amt="50">50</button><button data-amt="100">100</button>
+      </div>
+      <div class="row"><span>找零</span><b id="pay-change">RM 0.00</b></div>
+      <div id="cash-round-note" class="hint"></div>
+    </div>
+    <div id="pay-qr" class="pay-pane hidden">
+      <div class="qr-amount pay-due">RM 0.00</div>
+      <div id="pay-qr-box" class="qr-box"></div>
+      <div id="pay-qr-note" class="hint center">请顾客扫码付款，付款后点确认收款。</div>
+      <div id="pay-auto" class="pay-auto hidden"></div>
+      <button id="qr-full-btn" class="btn big">全屏显示 QR</button>
+    </div>
+    <div id="pay-card" class="pay-pane hidden">
+      <div class="row total"><span>应付</span><b class="pay-due">RM 0.00</b></div>
+      <div class="hint center">请在刷卡机完成交易后点确认收款。</div>
+    </div>
+    <div id="pay-credit" class="pay-pane hidden">
+      <div class="row total"><span>应付（不舍入）</span><b id="credit-total">RM 0.00</b></div>
+      <label>先付定金 RM <input id="credit-deposit" type="number" min="0" step="0.10" value="0"></label>
+      <div class="pay-methods small">
+        <button data-dm="CASH" class="dmbtn active">定金：现金</button>
+        <button data-dm="CARD" class="dmbtn">卡</button>
+        <button data-dm="DUITNOW" class="dmbtn">DuitNow</button>
+      </div>
+      <div id="credit-qr" class="hidden">
+        <div class="qr-amount" id="credit-qr-amt">RM 0.00</div>
+        <div id="credit-qr-box" class="qr-box"></div>
+        <div id="credit-auto" class="pay-auto hidden"></div>
+      </div>
+      <div class="row"><span>记账欠款</span><b id="credit-due">RM 0.00</b></div>
+    </div>
+    <button id="pay-confirm" class="btn primary big">确认收款</button>
+  </div>
+</div>
+
+<!-- ======================= PRODUCT MODAL ======================= -->
+<div id="product-modal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-head"><span id="prod-modal-title">商品</span><button class="modal-x" data-close="product-modal">✕</button></div>
+    <input id="prod-id" type="hidden">
+    <label>中文名 <input id="prod-name" type="text"></label>
+    <label>English name <input id="prod-name-en" type="text"></label>
+    <label>分类 <select id="prod-cat"></select></label>
+    <div class="two">
+      <label>售价 RM <input id="prod-price" type="number" min="0" step="0.10"></label>
+      <label>成本 RM <input id="prod-cost" type="number" min="0" step="0.10"></label>
+    </div>
+    <div class="two">
+      <label>条码 <input id="prod-barcode" type="text"></label>
+      <label>SKU <input id="prod-sku" type="text"></label>
+    </div>
+    <label>盘点库存（填了即按此数量校正） <input id="prod-stock" type="number" step="1" placeholder="不填 = 不改库存"></label>
+    <label>缺货阈值 reorder level（0 = 用全局阈值） <input id="prod-reorder" type="number" min="0" step="1"></label>
+    <label class="check"><input id="prod-active" type="checkbox" checked> 上架</label>
+    <div class="prod-img-row">
+      <img id="prod-img-preview" class="prod-img hidden" alt="">
+      <input id="prod-img-file" type="file" accept="image/*" class="hidden">
+      <button id="prod-img-btn" class="btn" type="button">设置商品图</button>
+      <button id="prod-label" class="btn" type="button">打印条码标签</button>
+      <button id="prod-queue" class="btn" type="button">加入条码队列</button>
+      <button id="prod-img-del" class="btn danger hidden" type="button">删图</button>
+    </div>
+    <button id="prod-save" class="btn primary big">保 存</button>
+    <button id="prod-del" class="btn danger big hidden">删除此商品</button>
+  </div>
+</div>
+
+<!-- ======================= SALE DETAIL MODAL ======================= -->
+<div id="sale-modal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-head"><span id="sale-title">小票</span><button class="modal-x" data-close="sale-modal">✕</button></div>
+    <div id="sale-body"></div>
+    <button id="sale-print" class="btn big">🖨 打印小票</button>
+    <button id="sale-void" class="btn danger big hidden">作废此单（管理员）</button>
+  </div>
+</div>
+
+<!-- ======================= HELD MODAL ======================= -->
+<div id="held-modal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-head"><span>挂单</span><button class="modal-x" data-close="held-modal">✕</button></div>
+    <div id="held-list" class="list"></div>
+  </div>
+</div>
+
+<!-- ======================= CUSTOMER MODAL ======================= -->
+<div id="customer-modal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-head"><span id="cust-modal-title">客户</span><button class="modal-x" data-close="customer-modal">✕</button></div>
+    <input id="cust-id" type="hidden">
+    <label>姓名 <input id="cust-name" type="text"></label>
+    <label>电话 <input id="cust-phone" type="text"></label>
+    <label>备注 <input id="cust-note" type="text"></label>
+    <button id="cust-save" class="btn primary big">保 存</button>
+    <button id="cust-del" class="btn danger big hidden">删除此客户</button>
+  </div>
+</div>
+
+<!-- ======================= PURCHASE FORM MODAL ======================= -->
+<div id="purchase-modal" class="modal hidden">
+  <div class="modal-card wide">
+    <div class="modal-head"><span>新建采购（入货）</span><button class="modal-x" data-close="purchase-modal">✕</button></div>
+    <label>供应商 <select id="pur-supplier"></select></label>
+    <div class="two">
+      <label>进货单号 <input id="pur-invoice" type="text"></label>
+      <label>发票日期 <input id="pur-date" type="date"></label>
+    </div>
+    <div class="two">
+      <label>折扣 Discount RM <input id="pur-fee-discount" type="number" min="0" step="0.10" value="0"></label>
+      <label>SST / Tax RM <input id="pur-fee-tax" type="number" min="0" step="0.10" value="0"></label>
+    </div>
+    <div class="two">
+      <label>运费 Delivery RM <input id="pur-fee-delivery" type="number" min="0" step="0.10" value="0"></label>
+      <label>其他 Other RM <input id="pur-fee-other" type="number" min="0" step="0.10" value="0"></label>
+    </div>
+    <div class="pur-ocr">
+      <input id="pur-ocr-file" type="file" accept="image/*" class="hidden">
+      <button id="pur-ocr-btn" class="btn" type="button">📷 拍进货单 → 生成 OCR 草稿核对</button>
+      <span id="pur-ocr-status" class="summary-text"></span>
+    </div>
+    <details id="pur-ocr-details" class="hidden">
+      <summary>识别原文</summary>
+      <pre id="pur-ocr-text"></pre>
+    </details>
+    <div id="pur-lines"></div>
+    <button id="pur-line-add" class="btn" type="button">＋ 加一行</button>
+    <div class="row total"><span>采购总计</span><b id="pur-total">RM 0.00</b></div>
+    <button id="pur-save" class="btn primary big">确认入货（库存增加）</button>
+  </div>
+</div>
+
+<!-- ======================= PURCHASE DETAIL MODAL ======================= -->
+<div id="purchase-detail-modal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-head"><span id="purd-title">采购单</span><button class="modal-x" data-close="purchase-detail-modal">✕</button></div>
+    <div id="purd-body"></div>
+    <button id="purd-reverse" class="btn danger big hidden">反冲此采购（管理员）</button>
+  </div>
+</div>
+
+<!-- ======================= SUPPLIER MODAL ======================= -->
+<div id="supplier-modal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-head"><span>供应商</span><button class="modal-x" data-close="supplier-modal">✕</button></div>
+    <input id="sup-id" type="hidden">
+    <label>名称 <input id="sup-name" type="text"></label>
+    <label>电话 <input id="sup-phone" type="text"></label>
+    <label>Email <input id="sup-email" type="email"></label>
+    <label>备注 <input id="sup-note" type="text"></label>
+    <button id="sup-save" class="btn primary big">保 存</button>
+  </div>
+</div>
+
+<!-- ======================= CLOSING MODAL ======================= -->
+<div id="closing-modal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-head"><span>日结</span><button class="modal-x" data-close="closing-modal">✕</button></div>
+    <label>营业日 <input id="closing-date" type="date"></label>
+    <label>现金盘点 RM（数钱柜里的现金） <input id="closing-counted" type="number" min="0" step="0.10"></label>
+    <div id="closing-result"></div>
+    <button id="closing-save" class="btn primary big">确认日结</button>
+    <h4 class="sec-title">历史日结</h4>
+    <div id="closing-list" class="list compact"></div>
+  </div>
+</div>
+
+<!-- ======================= CHANGE MODAL ======================= -->
+<!-- ======================= COST ALERT ======================= -->
+<div id="cost-alert-modal" class="modal hidden">
+  <div class="modal-card">
+    <h3>⚠️ 进货涨价提醒</h3>
+    <div id="cost-alert-list"></div>
+    <p class="hint">规则：成本涨幅 ≥ 10% 且涨额 ≥ RM 0.10 才提醒。成本涨了记得检查售价，别让毛利被吃掉。</p>
+    <button id="cost-alert-ok" class="btn primary big">知道了</button>
+  </div>
+</div>
+
+<div id="change-modal" class="modal hidden">
+  <div class="modal-card center">
+    <div class="change-title">找零 / CHANGE</div>
+    <div id="change-lines" class="change-lines"></div>
+    <div id="change-amt" class="change-amt">RM 0.00</div>
+    <button id="change-ok" class="btn primary big">确 认</button>
+  </div>
+</div>
+
+<!-- ======================= SUCCESS SHEET ======================= -->
+<div id="success-modal" class="modal hidden">
+  <div class="modal-card center">
+    <div class="success-tick">✓</div>
+    <div class="success-title">收款成功 / Paid</div>
+    <div id="success-info" class="summary-text"></div>
+    <button id="success-ereceipt" class="btn big whatsapp">电子收据 PDF</button>
+    <button id="success-print" class="btn big">打印小票</button>
+    <button id="success-done" class="btn primary big">完 成</button>
+  </div>
+</div>
+
+<!-- ======================= SCAN OVERLAY ======================= -->
+<div id="scan-overlay" class="scan-overlay hidden">
+  <div class="scan-head">
+    <span id="scan-status">连续扫码 · 扫一次加 1 件</span>
+    <button id="scan-done" class="btn primary">完成</button>
+    <button id="scan-close" class="btn ghost">✕</button>
+  </div>
+  <video id="scan-video" playsinline muted></video>
+  <div class="scan-photo-row">
+    <button id="scan-photo-btn" class="btn primary big">📷 拍照扫条码（iPhone 用这个）</button>
+    <input id="scan-file" type="file" accept="image/*" capture="environment" class="hidden">
+  </div>
+  <div id="scan-manual">
+    <input id="scan-q" type="search" placeholder="手动搜索：名称 / SKU / 条码">
+    <div id="scan-results" class="list"></div>
+  </div>
+</div>
+
+<!-- ======================= QR FULLSCREEN ======================= -->
+<div id="qr-full" class="qr-full hidden">
+  <div id="qr-full-shop" class="qr-full-shop"></div>
+  <div id="qr-full-amt" class="qr-full-amt"></div>
+  <div id="qr-full-box" class="qr-full-box"></div>
+  <div class="qr-full-note">请扫描付款 / Scan to pay</div>
+  <button id="qr-full-close" class="btn ghost big">关闭</button>
+</div>
+
+<!-- ======================= PURCHASE CHOOSER ======================= -->
+<div id="pur-choose-modal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-head"><span>新建采购</span><button class="modal-x" data-close="pur-choose-modal">✕</button></div>
+    <button id="choose-ocr-camera" class="btn big">📷 拍照 OCR</button>
+    <button id="choose-ocr-gallery" class="btn big">🖼 相册 OCR</button>
+    <button id="choose-manual" class="btn big">✍️ 手动进货</button>
+    <p class="hint">OCR 草稿在进货页下方列表，未入库前不影响库存，可随时继续或删除。</p>
+    <input id="pur-choose-file" type="file" accept="image/*" class="hidden">
+  </div>
+</div>
+
+<!-- ======================= REVERSE MODAL ======================= -->
+<div id="reverse-modal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-head"><span>撤销进货</span><button class="modal-x" data-close="reverse-modal">✕</button></div>
+    <label>撤销原因（必选）
+      <select id="rev-reason">
+        <option value="OCR 识别错误">OCR 识别错误</option>
+        <option value="重复入库">重复入库</option>
+        <option value="供应商单据错误">供应商单据错误</option>
+        <option value="进货取消">进货取消</option>
+        <option value="其他">其他</option>
+      </select></label>
+    <label>备注 <input id="rev-notes" type="text"></label>
+    <div class="hint">系统会先做安全检查：该采购的商品之后若已有库存变动，将拒绝直接撤销并提示人工处理。</div>
+    <button id="rev-confirm" class="btn danger big">确认撤销</button>
+  </div>
+</div>
+
+<div id="print-area"></div>
+<div id="toast" class="toast hidden"></div>
+<div id="pay-banner" class="pay-banner hidden"></div>
+
+<script src="assets/qrcode.min.js?v=1"></script>
+<script src="assets/emv.js?v=1"></script>
+<script src="assets/app.js?v=17"></script>
+</body>
+</html>
