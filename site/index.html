@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>CNKH POS 2.0</title>
-<link rel="stylesheet" href="assets/app.css?v=10">
+<link rel="stylesheet" href="assets/app.css?v=11">
 </head>
 <body>
 
@@ -149,6 +149,7 @@
       <div class="page-tools">
         <input id="prod-search" type="search" placeholder="搜索商品">
         <button id="prod-add" class="btn primary">+ 新增商品</button>
+        <button id="prod-import" class="btn">📥 导入商品</button>
         <button id="cat-add" class="btn">+ 分类</button>
       </div>
       <div id="prod-list" class="list"></div>
@@ -524,6 +525,7 @@
       <label>条码 <input id="prod-barcode" type="text"></label>
       <label>SKU <input id="prod-sku" type="text"></label>
     </div>
+    <button id="prod-gen-barcode" class="btn" type="button">🏷️ 自动生成条码</button>
     <label>盘点库存（填了即按此数量校正） <input id="prod-stock" type="number" step="1" placeholder="不填 = 不改库存"></label>
     <label>缺货阈值 reorder level（0 = 用全局阈值） <input id="prod-reorder" type="number" min="0" step="1"></label>
     <label class="check"><input id="prod-active" type="checkbox" checked> 上架</label>
@@ -537,6 +539,30 @@
     </div>
     <button id="prod-save" class="btn primary big">保 存</button>
     <button id="prod-del" class="btn danger big hidden">删除此商品</button>
+  </div>
+</div>
+
+<!-- ======================= ADMIN PIN CONFIRM MODAL ======================= -->
+<div id="pin-modal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-head"><span>管理员确认</span><button class="modal-x" data-close="pin-modal">✕</button></div>
+    <p class="hint" id="pin-modal-msg"></p>
+    <label>管理员 PIN <input id="pin-modal-input" type="password" inputmode="numeric" maxlength="12" autocomplete="off"></label>
+    <button id="pin-modal-ok" class="btn primary big">确认</button>
+    <button id="pin-modal-cancel" class="btn big">取消</button>
+  </div>
+</div>
+
+<!-- ======================= IMPORT PRODUCTS MODAL ======================= -->
+<div id="import-modal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-head"><span>导入商品</span><button class="modal-x" data-close="import-modal">✕</button></div>
+    <p class="hint">支持 Word（.docx，表格或文本行）、Excel（.xlsx，读第一个工作表）、CSV。表头可识别：名称、售价、成本、库存、条码、分类、单位、货号（中英文皆可）。<b>没有条码的商品会自动生成 EAN-13 条码</b>；条码已被其他商品占用、或在文件里重复的行会跳过并说明原因。一次最多 1000 条，文件 ≤ 10MB。</p>
+    <input id="imp-file" type="file" accept=".xlsx,.docx,.csv">
+    <div id="imp-errors" class="hint"></div>
+    <div id="imp-preview" class="imp-preview"></div>
+    <button id="imp-confirm" class="btn primary big" disabled>确认导入</button>
+    <button id="imp-cancel" class="btn big">取消</button>
   </div>
 </div>
 
@@ -737,6 +763,6 @@
 
 <script src="assets/qrcode.min.js?v=1"></script>
 <script src="assets/emv.js?v=1"></script>
-<script src="assets/app.js?v=19"></script>
+<script src="assets/app.js?v=21"></script>
 </body>
 </html>
