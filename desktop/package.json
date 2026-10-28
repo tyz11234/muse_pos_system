@@ -1,6 +1,6 @@
 {
   "name": "cnkh-pos2-desktop",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
   "main": "main.js",
   "scripts": {
@@ -12,8 +12,14 @@
   },
   "build": {
     "appId": "com.cnkh.pos2.desktop",
-    "productName": "CNKH POS",
-    "files": ["main.js"],
-    "win": { "target": "portable" }
+    "productName": "CNKH POS 2.0",
+    "files": [
+      "main.js",
+      "icon.png"
+    ],
+    "win": {
+      "target": "portable",
+      "icon": "icon.png"
+    }
   }
 }
