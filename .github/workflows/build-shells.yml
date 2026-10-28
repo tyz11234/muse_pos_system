@@ -40,10 +40,13 @@ jobs:
       - run: npm install
       - run: npx cap add ios
       - run: npx cap sync ios
+      - name: Install CocoaPods dependencies
+        working-directory: ios/App
+        run: pod install
       - name: Build unsigned app
         working-directory: ios/App
         run: |
-          xcodebuild -project App.xcodeproj -scheme App -configuration Release \
+          xcodebuild -workspace App.xcworkspace -scheme App -configuration Release \
             -sdk iphoneos -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
       - name: Package unsigned IPA
