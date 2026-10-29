@@ -28,6 +28,8 @@ from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocke
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
+from import_parse import parse_product_file
+
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.environ.get("POS2_DB", os.path.join(APP_DIR, "pos2.db"))
 SITE_DIR = os.environ.get("POS2_SITE", os.path.join(APP_DIR, "..", "site"))
@@ -337,14 +339,12 @@ def _line_total(price_cents, qty):
 
 
 def _round5(cents):
-    """Malaysian 5-sen checkout rounding (non-credit sales only):
-    last sen digit 1-4 rounds down, 5 stays, 6-9 rounds up."""
-    r = cents % 10
-    if r == 0 or r == 5:
-        return cents
-    if r < 5:
-        return cents - r
-    return cents + (10 - r)
+    """Malaysian 5-sen rounding mechanism (non-credit sales only),
+    the official BNM table: last sen digit 1-2 rounds down to 0,
+    3-4 rounds up to 5, 5 stays, 6-7 rounds down to 5, 8-9 rounds
+    up to the next 10."""
+    delta = (0, -1, -2, 2, 1, 0, -1, -2, 2, 1)
+    return cents + delta[cents % 10]
 
 
 def _next_seq(c, key, table, column, prefix):
@@ -531,10 +531,12 @@ async def upsert_category(req: Request, authorization: str = Header(default=""))
         raise HTTPException(400, "name required")
     with db() as c:
         if body.get("id"):
-            c.execute(
+            cur = c.execute(
                 "UPDATE categories SET name=?, sort=? WHERE id=?",
                 (name, int(body.get("sort", 0)), int(body["id"])),
             )
+            if not cur.rowcount:
+                raise HTTPException(404, "category not found")
             cid = int(body["id"])
         else:
             cur = c.execute(
@@ -676,6 +678,182 @@ async def upsert_product(req: Request, authorization: str = Header(default="")):
     return {"ok": True, "id": pid}
 
 
+# ------------------------------------------------- product import ----
+def _ean13(first12):
+    total = sum((1 if i % 2 == 0 else 3) * int(d) for i, d in enumerate(first12))
+    return first12 + str((10 - total % 10) % 10)
+
+
+def _ean13_valid(code):
+    return (isinstance(code, str) and len(code) == 13 and code.isdigit()
+            and _ean13(code[:12]) == code)
+
+
+def _gen_barcode(c, taken):
+    """Next free in-store EAN-13 (prefix 200) with a correct check digit."""
+    seq = int(c.execute("SELECT COUNT(*) AS n FROM products").fetchone()["n"]) + 1
+    while True:
+        code = _ean13("200" + str(seq).zfill(9))
+        if code not in taken and not c.execute(
+                "SELECT 1 FROM products WHERE barcode=?", (code,)).fetchone():
+            return code
+        seq += 1
+
+
+@app.post("/api/products/import/preview")
+async def import_preview(req: Request, authorization: str = Header(default="")):
+    require_admin(current_user(authorization))
+    body = await req.json()
+    try:
+        data = base64.b64decode(str(body.get("data_b64", "")), validate=True)
+    except Exception:
+        raise HTTPException(400, "文件数据无效")
+    if not data:
+        raise HTTPException(400, "文件为空")
+    if len(data) > 10 * 1024 * 1024:
+        raise HTTPException(400, "文件不能超过 10MB")
+    try:
+        parsed = parse_product_file(data, str(body.get("filename", "")))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(400, "文件解析失败：" + str(e)[:120])
+    with db() as c:
+        existing = {r["barcode"] for r in c.execute(
+            "SELECT barcode FROM products WHERE barcode<>''").fetchall()}
+    seen = set()
+    for r in parsed["rows"]:
+        bc = r.get("barcode", "")
+        if not bc:
+            r["_status"] = "generate"
+        elif bc in seen:
+            r["_status"] = "dup_file"
+        elif bc in existing:
+            r["_status"] = "exists"
+        elif len(bc) == 13 and bc.isdigit() and not _ean13_valid(bc):
+            r["_status"] = "bad_checksum"
+        else:
+            r["_status"] = "ok"
+        if bc:
+            seen.add(bc)
+    return {"ok": True, **parsed}
+
+
+@app.post("/api/products/import/confirm")
+async def import_confirm(req: Request, authorization: str = Header(default="")):
+    user = current_user(authorization)
+    require_admin(user)
+    body = await req.json()
+    rows = body.get("rows") or []
+    if not isinstance(rows, list) or not rows:
+        raise HTTPException(400, "没有可导入的商品")
+    if len(rows) > 1000:
+        raise HTTPException(400, "一次最多导入 1000 条")
+    created, skipped = [], []
+    with db() as c:
+        existing = {r["barcode"]: r["name"] for r in c.execute(
+            "SELECT barcode, name FROM products WHERE barcode<>''").fetchall()}
+        taken = set(existing)
+        cat_cache = {}
+        for r in rows:
+            name = str(r.get("name", "")).strip()
+            if not name:
+                skipped.append({"name": "(无名称)", "reason": "缺少名称"})
+                continue
+            try:
+                price = int(r.get("price_cents"))
+                cost = int(r.get("cost_cents") or 0)
+                stock = float(r.get("stock_qty") or 0)
+            except (TypeError, ValueError):
+                skipped.append({"name": name, "reason": "价格/库存不是数字"})
+                continue
+            if price < 0 or cost < 0 or stock < 0:
+                skipped.append({"name": name, "reason": "价格/成本/库存不能为负"})
+                continue
+            bc = str(r.get("barcode", "")).strip()
+            generated = False
+            if bc:
+                if len(bc) == 13 and bc.isdigit() and not _ean13_valid(bc):
+                    skipped.append({"name": name, "reason": "条码校验位错误"})
+                    continue
+                if bc in taken:
+                    why = ("文件内条码重复" if existing.get(bc) is None
+                           else "条码已被商品「" + str(existing.get(bc)) + "」使用")
+                    skipped.append({"name": name, "reason": why})
+                    continue
+            else:
+                bc = _gen_barcode(c, taken)
+                generated = True
+            taken.add(bc)
+            cat_id = None
+            cat_name = str(r.get("category_name", "")).strip()
+            if cat_name:
+                if cat_name not in cat_cache:
+                    crow = c.execute(
+                        "SELECT id FROM categories WHERE name=? AND is_active=1",
+                        (cat_name,)).fetchone()
+                    if crow:
+                        cat_cache[cat_name] = crow["id"]
+                    else:
+                        cur = c.execute("INSERT INTO categories(name) VALUES(?)",
+                                        (cat_name,))
+                        cat_cache[cat_name] = cur.lastrowid
+                cat_id = cat_cache[cat_name]
+            cur = c.execute(
+                "INSERT INTO products(sku,barcode,name,name_en,category_id,"
+                "price_cents,cost_cents,stock_qty,unit,reorder_level,updated_at)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (str(r.get("sku", "")), bc, name, str(r.get("name_en", "")),
+                 cat_id, price, cost, stock,
+                 str(r.get("unit", "") or "pcs"), 0, now_iso()),
+            )
+            pid = cur.lastrowid
+            if stock:
+                c.execute(
+                    "INSERT INTO stock_moves(product_id,delta,qty_after,reason,ref,created_at)"
+                    " VALUES(?,?,?,?,?,?)",
+                    (pid, stock, stock, "import", user["username"], now_iso()),
+                )
+            created.append({"id": pid, "name": name, "barcode": bc,
+                            "generated": generated})
+    return {"ok": True, "created": created, "skipped": skipped,
+            "created_count": len(created), "skipped_count": len(skipped)}
+
+
+@app.post("/api/products/{pid}/barcode")
+async def regenerate_barcode(pid: int, req: Request,
+                             authorization: str = Header(default="")):
+    """Generate a fresh EAN-13 for an existing product, retiring the old
+    code. Admin-only AND the admin must re-enter their own PIN, so a
+    barcode can never be swapped by accident or by a staff account."""
+    user = current_user(authorization)
+    require_admin(user)
+    body = await req.json()
+    pin = str(body.get("pin", ""))
+    with db() as c:
+        me = c.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
+        if not me or not verify_pin(pin, me["pin_salt"], me["pin_hash"]):
+            raise HTTPException(403, "管理员 PIN 不正确")
+        prod = c.execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone()
+        if not prod:
+            raise HTTPException(404, "product not found")
+        old = prod["barcode"] or ""
+        taken = {r["barcode"] for r in c.execute(
+            "SELECT barcode FROM products WHERE barcode<>'' AND id<>?",
+            (pid,)).fetchall()}
+        new_code = _gen_barcode(c, taken)
+        c.execute("UPDATE products SET barcode=?, updated_at=? WHERE id=?",
+                  (new_code, now_iso(), pid))
+        c.execute(
+            "INSERT INTO audit_logs(occurred_at,username,role,action,module,"
+            "product_id,product_name,context,old_value,new_value,reason)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (now_iso(), user["username"], user["role"], "barcode_regenerate",
+             "products", pid, prod["name"], "product",
+             old, new_code, "管理员确认后生成新条码" if old else "管理员确认后生成条码"))
+    return {"ok": True, "barcode": new_code, "old_barcode": old}
+
+
 # -------------------------------------------------------------- sales ----
 @app.post("/api/sales")
 async def create_sale(req: Request, authorization: str = Header(default="")):
@@ -685,6 +863,8 @@ async def create_sale(req: Request, authorization: str = Header(default="")):
     if not items:
         raise HTTPException(400, "items required")
     method = str(body.get("method", "CASH")).upper()
+    if method not in ("CASH", "CARD", "DUITNOW", "CREDIT"):
+        raise HTTPException(400, "付款方式无效")
     discount = _int_or_400(body.get("discount_cents", 0), "discount_cents")
     with db() as c:
         trow = c.execute(
@@ -902,7 +1082,8 @@ def get_settings(authorization: str = Header(default="")):
     current_user(authorization)
     with db() as c:
         rows = c.execute("SELECT key,value FROM settings").fetchall()
-    return {"ok": True, "settings": {r["key"]: r["value"] for r in rows}}
+    return {"ok": True, "settings": {r["key"]: r["value"] for r in rows
+                                     if not r["key"].startswith("doc_seq:")}}
 
 
 @app.post("/api/settings")
@@ -1597,11 +1778,13 @@ async def upsert_customer(req: Request, authorization: str = Header(default=""))
         raise HTTPException(400, "name required")
     with db() as c:
         if body.get("id"):
-            c.execute(
+            cur = c.execute(
                 "UPDATE customers SET name=?,phone=?,note=?,is_active=? WHERE id=?",
                 (name, str(body.get("phone", "")), str(body.get("note", "")),
                  1 if body.get("is_active", 1) else 0, int(body["id"])),
             )
+            if not cur.rowcount:
+                raise HTTPException(404, "customer not found")
             cid = int(body["id"])
         else:
             cur = c.execute(
@@ -1635,7 +1818,8 @@ async def repay_credit(sale_id: int, req: Request,
         raise HTTPException(400, "amount required")
     with db() as c:
         sale = c.execute("SELECT * FROM sales WHERE id=?", (sale_id,)).fetchone()
-        if not sale or sale["method"] != "CREDIT" or sale["is_void"]:
+        if not sale or sale["method"] != "CREDIT" or sale["is_void"] \
+                or sale["is_training"]:
             raise HTTPException(404, "credit sale not found")
         due = sale["total_cents"] - sale["paid_cents"]
         if amount > due:
@@ -1669,13 +1853,15 @@ async def upsert_supplier(req: Request, authorization: str = Header(default=""))
         raise HTTPException(400, "name required")
     with db() as c:
         if body.get("id"):
-            c.execute(
+            cur = c.execute(
                 "UPDATE suppliers SET name=?,phone=?,email=?,note=?,is_active=?"
                 " WHERE id=?",
                 (name, str(body.get("phone", "")), str(body.get("email", "")),
                  str(body.get("note", "")),
                  1 if body.get("is_active", 1) else 0, int(body["id"])),
             )
+            if not cur.rowcount:
+                raise HTTPException(404, "supplier not found")
             sid = int(body["id"])
         else:
             cur = c.execute(
@@ -1773,7 +1959,8 @@ async def create_purchase(req: Request, authorization: str = Header(default=""))
     with db() as c:
         if invoice_no and supplier_id:
             dup = c.execute(
-                "SELECT id FROM purchases WHERE supplier_id=? AND invoice_no=?"
+                "SELECT id FROM purchases WHERE supplier_id=?"
+                " AND LOWER(TRIM(invoice_no))=LOWER(TRIM(?))"
                 " AND is_reversed=0",
                 (supplier_id, invoice_no),
             ).fetchone()
@@ -1782,7 +1969,7 @@ async def create_purchase(req: Request, authorization: str = Header(default=""))
         total = -discount_p + tax_p + delivery_p + other_p
         by_pid = {}
         for it in items:
-            p = c.execute("SELECT * FROM products WHERE id=?",
+            p = c.execute("SELECT * FROM products WHERE id=? AND is_active=1",
                           (_int_or_400(it.get("product_id"),
                                        "product_id"),)).fetchone()
             if not p:
@@ -2232,7 +2419,9 @@ async def create_closing(req: Request, authorization: str = Header(default="")):
             " FROM sales s LEFT JOIN (SELECT sale_id,"
             " SUM(amount_cents) t FROM credit_payments GROUP BY sale_id) rp"
             " ON rp.sale_id=s.id WHERE s.is_void=0 AND s.is_training=0"
-            " AND s.method='CREDIT' AND substr(s.created_at,1,10)=?",
+            " AND s.method='CREDIT'"
+            " AND COALESCE(s.deposit_method,'CASH')='CASH'"
+            " AND substr(s.created_at,1,10)=?",
             (day,)).fetchone()["t"]
         repayments = c.execute(
             "SELECT COALESCE(SUM(amount_cents),0) t FROM credit_payments"
