@@ -29,7 +29,7 @@ function emvCrc16(data) {
 function emvIsValid(payload) {
   var tags = emvParse(payload);
   if (!tags || !tags.length || tags[tags.length - 1][0] !== '63') return false;
-  return emvCrc16(payload.slice(0, -4)) === payload.slice(-4);
+  return emvCrc16(payload.slice(0, -4)) === payload.slice(-4).toUpperCase();
 }
 function emvTag(payload, tag) {
   var tags = emvParse(payload);
