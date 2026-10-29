@@ -108,6 +108,7 @@ function logout(expired) {
   document.querySelectorAll('.modal').forEach((m) => m.classList.add('hidden'));
   $('pay-banner').classList.add('hidden');
   $('cart-discount').value = '0';
+  $('cart-discount').dataset.audited = '0';
   $('view-app').classList.add('hidden');
   $('view-login').classList.remove('hidden');
   if (expired) $('login-error').textContent = '登录已过期，请重新登录';
@@ -228,7 +229,7 @@ function renderPos() {
       const card = document.createElement('button');
       card.className = 'pcard' + (p.stock_qty <= 0 ? ' out' : '');
       card.innerHTML =
-        (p.has_image ? '<img class="pth" src="' + productImageUrl(p.id) + '" alt="">' : '') +
+        (settings.product_images_enabled !== '0' && p.has_image ? '<img class="pth" src="' + productImageUrl(p.id) + '" alt="">' : '') +
         '<span class="pname">' + esc(p.name) + '</span>' +
         '<span class="pprice">' + fmt(p.price_cents) + '</span>' +
         '<span class="pstock' + (p.low_stock ? ' low' : '') + '">库存 ' +
@@ -257,9 +258,11 @@ function addToCart(p) {
 }
 
 function round5js(cents) {
-  const r = cents % 10;
-  if (r === 0 || r === 5) return cents;
-  return r < 5 ? cents - r : cents + (10 - r);
+  // Malaysian 5-sen rounding mechanism (official BNM table), mirrors
+  // the server's _round5: 1-2 down to 0, 3-4 up to 5, 5 stays,
+  // 6-7 down to 5, 8-9 up to the next 10.
+  const delta = [0, -1, -2, 2, 1, 0, -1, -2, 2, 1];
+  return cents + delta[((cents % 10) + 10) % 10];
 }
 function postAudit(body) {
   api('/api/audit', { method: 'POST', body: JSON.stringify(body) })
@@ -344,7 +347,11 @@ function restoreCart() {
         });
       }
     });
-    if (saved.discount) $('cart-discount').value = saved.discount;
+    if (saved.discount) {
+      $('cart-discount').value = saved.discount;
+      $('cart-discount').dataset.audited =
+        String(Math.round(parseFloat(saved.discount) * 100) || 0);
+    }
   } catch (_) { /* corrupted snapshot: start fresh */ }
 }
 
@@ -373,7 +380,19 @@ function renderCart() {
       if (entry.qty <= 0) cart.delete(p.id); else cart.set(p.id, entry);
       renderCart();
     };
-    plus.onclick = () => { entry.qty += 1; cart.set(p.id, entry); renderCart(); };
+    plus.onclick = () => {
+      const want = entry.qty + 1;
+      if (!p._snap && typeof p.stock_qty === 'number' && want > p.stock_qty) {
+        if ((settings.stock_policy || 'warn') === 'block') {
+          toast('库存不足 / Insufficient stock（有 ' + p.stock_qty + '）：' + p.name);
+          return;
+        }
+        if (!confirm(p.name + '\n需要 ' + want + ' · 库存 ' + p.stock_qty + '\n仍要加购？')) return;
+      }
+      entry.qty = want;
+      cart.set(p.id, entry);
+      renderCart();
+    };
     row.querySelector('.discbtn').onclick = () => editLineDiscount(entry);
     box.appendChild(row);
   });
@@ -431,8 +450,14 @@ function showPayPane() {
       box.innerHTML = '';
       $('pay-qr-note').textContent = '应付为 0，无需扫码，直接点确认收款。';
     } else if (payload && emvIsValid(payload)) {
-      box.innerHTML = qrSvgSafe(emvBuildDynamic(payload, total), 5);
-      $('pay-qr-note').textContent = '金额已锁定，请顾客扫码付款，付款后点确认收款。';
+      const dyn = emvBuildDynamic(payload, total);
+      if (dyn) {
+        box.innerHTML = qrSvgSafe(dyn, 5);
+        $('pay-qr-note').textContent = '金额已锁定，请顾客扫码付款，付款后点确认收款。';
+      } else {
+        box.innerHTML = qrSvgSafe(payload, 5);
+        $('pay-qr-note').textContent = '静态收款码（动态载荷构建失败），请顾客自行输入金额。';
+      }
     } else if (payload) {
       box.innerHTML = qrSvgSafe(payload, 5);
       $('pay-qr-note').textContent = '静态收款码（未识别出动态载荷），请顾客自行输入金额。';
@@ -467,12 +492,16 @@ async function confirmSale(bankRef) {
   } else {
     paid = total;
   }
-  // checkout-time stock re-check mirrors the till guard (warn policy asks)
-  if ((settings.stock_policy || 'warn') !== 'block') {
-    for (const { p, qty } of cart.values()) {
-      if (!p._snap && typeof p.stock_qty === 'number' && qty > p.stock_qty) {
-        if (!confirm('库存不足：' + p.name + '（有 ' + p.stock_qty + '）\n仍结账？')) return;
+  // checkout-time stock re-check mirrors the till guard:
+  // block policy stops the sale, warn policy asks first
+  const stockPolicy = settings.stock_policy || 'warn';
+  for (const { p, qty } of cart.values()) {
+    if (!p._snap && typeof p.stock_qty === 'number' && qty > p.stock_qty) {
+      if (stockPolicy === 'block') {
+        toast('库存不足 / Insufficient stock（有 ' + p.stock_qty + '）：' + p.name);
+        return;
       }
+      if (!confirm('库存不足：' + p.name + '（有 ' + p.stock_qty + '）\n仍结账？')) return;
     }
   }
   const items = [];
@@ -497,6 +526,7 @@ async function confirmSale(bankRef) {
     pendingSale = Object.assign({}, d, { method: payMethod, paid_cents: paid });
     cart.clear();
     $('cart-discount').value = '0';
+    $('cart-discount').dataset.audited = '0';
     $('checkout-modal').classList.add('hidden');
     renderCart();
     await loadCatalog();
@@ -1125,8 +1155,10 @@ async function downloadApi(path, filename) {
 document.querySelectorAll('#exp-sales,#exp-products,#exp-payments,#exp-backup')
   .forEach((b) => b.addEventListener('click', () => {
     if (b.id === 'exp-sales') {
-      const ym = localDateStr(new Date()).slice(0, 7);
-      downloadApi(`/export/sales.csv?date_from=${ym}-01&date_to=${ym}-31`, 'sales.csv');
+      const nowD = new Date();
+      const ym = localDateStr(nowD).slice(0, 7);
+      const lastDay = new Date(nowD.getFullYear(), nowD.getMonth() + 1, 0).getDate();
+      downloadApi(`/export/sales.csv?date_from=${ym}-01&date_to=${ym}-${String(lastDay).padStart(2, '0')}`, 'sales.csv');
     } else if (b.id === 'exp-products') downloadApi('/export/products.csv', 'products.csv');
     else if (b.id === 'exp-payments') downloadApi('/export/payments.csv', 'payments.csv');
     else downloadApi('/export/backup.json', 'pos2-backup.json');
@@ -1267,6 +1299,10 @@ async function loadBarcodeQueue() {
 }
 
 /* ---------------- discount audit page ---------------- */
+function auditMoney(v) {
+  const n = parseInt(v, 10);
+  return isNaN(n) ? esc(v) : fmt(n);
+}
 async function loadAudit() {
   const today = $('audit-today').checked ? 1 : 0;
   const user = encodeURIComponent($('audit-user').value.trim());
@@ -1283,7 +1319,7 @@ async function loadAudit() {
         (a.product_name ? ' · ' + esc(a.product_name) : '') + '</span>' +
         '<span class="s">' + esc((a.occurred_at || '').replace('T', ' ').slice(0, 19)) +
         ' · ' + esc(a.username) + '（' + esc(a.role) + '）</span></span>' +
-        '<span class="amt">' + esc(a.old_value) + ' → ' + esc(a.new_value) +
+        '<span class="amt">' + auditMoney(a.old_value) + ' → ' + auditMoney(a.new_value) +
         (a.reason ? ' · ' + esc(a.reason) : '') + '</span>';
       box.appendChild(row);
     });
@@ -1338,7 +1374,7 @@ const TRAINING_LESSONS = [
   ['3 · 收款', '结账选付款方式：现金输实收看找零；DuitNow 出示动态码（金额已锁定），顾客付完系统会自动对账入账（5 秒内可点「不是这单」）；刷卡在刷卡机完成后再确认。赊账必须选客户，可先收定金并选定金方式。非赊账金额按 5 仙规则舍入。'],
   ['4 · 退款（作废）', '退款 = 管理员在销售记录里把原单作废（要填备注），库存自动回滚。已提交 e-Invoice 的单作废前先与管理员核对发票状态。'],
   ['5 · 库存', '销售自动扣库存，进货自动加库存，盘点页可逐个商品填实盘数校正。库存不足时系统会提醒；设为「禁止」策略时不足不能卖。'],
-  ['6 · 手机连接（服务器）', '本系统所有设备打开同一个服务器地址即是同一套数据，无需配对：手机、平板、电脑浏览器打开 http://43.156.169.203/pos2/ 登录即可。'],
+  ['6 · 手机连接（服务器）', '本系统所有设备打开同一个服务器地址即是同一套数据，无需配对：手机、平板、电脑浏览器打开 http://43.156.169.203:88/ 登录即可。'],
   ['7 · 数据同步', '服务器是唯一主本：任何设备做的销售、改价、盘点即时写到服务器，其他设备自动刷新，不需要手动同步。'],
   ['8 · 数据备份', '管理员在设置 → 数据导出可导出销售/商品/收款 CSV 与全量备份 JSON；开业前清零在「管理 → 维护」，先算影响再执行。'],
   ['9 · e-Invoice 设置', 'e-Invoice 需要 MyInvois 凭证在服务器配置；未配置前所有单据状态为 Pending，不影响正常收银。'],
@@ -2602,7 +2638,7 @@ function handlePayment(p) {
   }
   handledRefs.add(p.ref_no);
   if (handledRefs.size > 300) handledRefs = new Set([...handledRefs].slice(-150));
-  speak(speechTextForCents(p.amount_cents));
+  speak(p.tts_text || speechTextForCents(p.amount_cents));
   const banner = $('pay-banner');
   banner.textContent = '💰 到账 ' + fmt(p.amount_cents) + ' · DuitNow';
   banner.classList.remove('hidden');
@@ -2686,7 +2722,7 @@ async function loadPayments() {
       btn.className = 'replay';
       btn.textContent = '🔊';
       btn.title = '重播这笔到账';
-      btn.onclick = () => speak(speechTextForCents(p.amount_cents));
+      btn.onclick = () => speak(p.tts_text || speechTextForCents(p.amount_cents));
       row.appendChild(btn);
       box.appendChild(row);
     });
@@ -2719,6 +2755,7 @@ async function holdCart() {
     });
     cart.clear();
     $('cart-discount').value = '0';
+    $('cart-discount').dataset.audited = '0';
     renderCart();
     toast('已挂单 ' + d.hold_no);
     loadHeldCount();
@@ -2731,8 +2768,10 @@ function openHeld() {
   if (!heldItems.length) box.innerHTML = '<div class="cart-empty">没有挂单</div>';
   heldItems.forEach((h) => {
     const items = (h.payload && h.payload.items) || [];
-    const total = items.reduce((a, it) => a + Math.round(it.price_cents * it.qty), 0) -
-      ((h.payload && h.payload.discount_cents) || 0);
+    const total = items.reduce((a, it) => {
+      const g = Math.round(it.price_cents * it.qty);
+      return a + g - Math.min(Math.max(0, it.discount_cents || 0), g);
+    }, 0) - ((h.payload && h.payload.discount_cents) || 0);
     const row = document.createElement('div');
     row.className = 'li';
     row.innerHTML =
@@ -2778,6 +2817,7 @@ async function resumeHeld(h) {
     });
   });
   $('cart-discount').value = ((payload.discount_cents || 0) / 100).toFixed(2);
+  $('cart-discount').dataset.audited = String(payload.discount_cents || 0);
   $('held-modal').classList.add('hidden');
   renderCart();
   loadHeldCount();
@@ -2851,8 +2891,15 @@ function renderCreditQr() {
   $('credit-qr-name').textContent = settings.store_name || '';
   $('credit-qr-amt').textContent = fmt(dep);
   const payload = (settings.duitnow_qr_payload || '').trim();
-  $('credit-qr-box').innerHTML =
-    payload && emvIsValid(payload) ? qrSvgSafe(emvBuildDynamic(payload, dep), 5) : '';
+  const cbox = $('credit-qr-box');
+  if (payload && emvIsValid(payload)) {
+    const dyn = emvBuildDynamic(payload, dep);
+    cbox.innerHTML = dyn ? qrSvgSafe(dyn, 5) : qrSvgSafe(payload, 5);
+  } else if (payload) {
+    cbox.innerHTML = qrSvgSafe(payload, 5);
+  } else {
+    cbox.innerHTML = '';
+  }
 }
 
 async function loadCustomersPage() {
@@ -3950,6 +3997,9 @@ function renderReceiptLines(sv, items, st) {
   L.push(padLine('SUBTOTAL', amt2(sv.subtotal_cents), W));
   if (on('receipt_show_discount'))
     L.push(padLine('DISCOUNT', '−' + amt2(sv.discount_cents || 0), W));
+  if (sv.rounding_cents)
+    L.push(padLine('ROUNDING / 舍入',
+      (sv.rounding_cents > 0 ? '+' : '−') + amt2(Math.abs(sv.rounding_cents)), W));
   L.push(padLine('TOTAL', amt2(sv.total_cents), W));
   L.push(padLine('PAID', amt2(sv.paid_cents), W));
   if (on('receipt_show_change'))
