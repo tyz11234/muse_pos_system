@@ -268,13 +268,13 @@ function postAudit(body) {
   api('/api/audit', { method: 'POST', body: JSON.stringify(body) })
     .catch(() => { /* audit is best-effort from the till */ });
 }
-function editLineDiscount(entry) {
+async function editLineDiscount(entry) {
   const { p } = entry;
   const gross = Math.round(p.price_cents * entry.qty);
   const cur = Math.min(Math.max(0, entry.disc || 0), gross);
-  const ans = prompt(
-    '行折扣：输入金额（如 2.50）或百分比（如 10%）；输入 0 清除。\n' +
-    p.name + ' 当前行折扣 ' + fmt(cur), '');
+  const ans = await uiPrompt(
+    '行折扣：输入金额（如 2.50）或百分比（如 10%）；输入 0 清除',
+    '', { msg: p.name + ' 当前行折扣 ' + fmt(cur) });
   if (ans === null) return;
   const t = ans.trim();
   let nd = 0;
@@ -370,7 +370,7 @@ function renderCart() {
       '<span class="cname">' + esc(p.name) + '<br><small>' + fmt(p.price_cents) +
       (disc ? ' → ' + fmt(g - disc) + '（−' + fmt(disc) + '）' : '') +
       '</small></span>' +
-      '<button class="qtybtn">−</button><span>' + qty + '</span>' +
+      '<button class="qtybtn">−</button><span>' + esc(String(qty)) + '</span>' +
       '<button class="qtybtn">+</button>' +
       '<button class="qtybtn discbtn" title="行折扣">折</button>' +
       '<span class="cprice">' + fmt(g - disc) + '</span>';
@@ -409,7 +409,24 @@ function renderCart() {
 }
 
 /* ---------------- checkout ---------------- */
+let checkoutRef = null;
+
+function newCheckoutRef() {
+  checkoutRef = (window.crypto && crypto.randomUUID)
+    ? crypto.randomUUID()
+    : 'cr-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10);
+  return checkoutRef;
+}
+
 function openCheckout() {
+  // a fresh checkout starts clean: never carry the previous sale's
+  // customer / phone into the next sale
+  const cc = $('co-customer');
+  if (cc) cc.value = '';
+  const cp = $('co-phone');
+  if (cp) { cp.value = ''; delete cp.dataset.auto; }
+  newCheckoutRef();
+  $('pay-paid').dataset.touched = '';
   $('credit-deposit').value = '';
   depositMethod = 'CASH';
   document.querySelectorAll('.dmbtn').forEach((b) =>
@@ -420,6 +437,29 @@ function openCheckout() {
   fillCustomerSelect();
   showPayPane();
   $('checkout-modal').classList.remove('hidden');
+  // Refresh cart prices from the server: a price changed on another
+  // device (or a held order's snapshot price) must never leave the
+  // client total disagreeing with what the server will charge.
+  (async () => {
+    try {
+      await loadCatalog();
+      let changed = false;
+      cart.forEach((entry, pid) => {
+        const np = products.find((p) => p.id === pid);
+        if (np && np.price_cents !== entry.p.price_cents) {
+          entry.p = np;
+          changed = true;
+        }
+      });
+      if (changed) {
+        renderCart();
+        if (!$('checkout-modal').classList.contains('hidden')) {
+          showPayPane();
+          toast('部分商品价格已更新，已按最新价格显示');
+        }
+      }
+    } catch (_) { /* offline: the server stays the source of truth */ }
+  })();
 }
 
 function showPayPane() {
@@ -440,6 +480,7 @@ function showPayPane() {
   }
   if (payMethod === 'CASH') {
     $('pay-paid').value = (total / 100).toFixed(2);
+    $('pay-paid').dataset.touched = '';
     updateChange();
   }
   if (payMethod === 'DUITNOW') {
@@ -510,10 +551,22 @@ async function confirmSale(bankRef) {
     if (disc) line.discount_cents = Math.min(disc, Math.round(p.price_cents * qty));
     items.push(line);
   });
+  const totalDisc = t.discount +
+    items.reduce((a, l) => a + (l.discount_cents || 0), 0);
+  const pinAbove = parseInt(settings.discount_pin_above_cents || '5000', 10) || 5000;
+  let adminPin = '';
+  if (totalDisc > pinAbove) {
+    const v = await uiPrompt(
+      '本单折扣共 ' + fmt(totalDisc) + '，超过 ' + fmt(pinAbove) +
+      '，需要管理员 PIN', '', { password: true, inputmode: 'numeric' });
+    if (!v) { toast('已取消结账（未输入管理员 PIN）'); return; }
+    adminPin = v;
+  }
   const soldItems = items.slice();
   $('pay-confirm').disabled = true;
+  let d;
   try {
-    const d = await api('/api/sales', {
+    d = await api('/api/sales', {
       method: 'POST',
       body: JSON.stringify({
         items, method: payMethod,
@@ -521,14 +574,28 @@ async function confirmSale(bankRef) {
         bank_ref: bankRef || '', customer_id: customerId,
         customer_phone: phone || undefined,
         deposit_method: payMethod === 'CREDIT' ? depositMethod : undefined,
+        admin_pin: adminPin || undefined,
+        // idempotency: retrying THIS checkout reuses the same ref, so a
+        // network blip after posting can never double-post the sale
+        client_ref: checkoutRef || newCheckoutRef(),
       }),
     });
-    pendingSale = Object.assign({}, d, { method: payMethod, paid_cents: paid });
-    cart.clear();
-    $('cart-discount').value = '0';
-    $('cart-discount').dataset.audited = '0';
-    $('checkout-modal').classList.add('hidden');
-    renderCart();
+  } catch (e) {
+    toast('结账失败：' + e.message);
+    $('pay-confirm').disabled = false;
+    return;
+  }
+  // The sale is posted from here on. Everything below is presentation and
+  // refresh — a failure there must never be reported as 结账失败.
+  pendingSale = Object.assign({}, d, { method: payMethod, paid_cents: paid });
+  checkoutRef = null;
+  cart.clear();
+  $('cart-discount').value = '0';
+  $('cart-discount').dataset.audited = '0';
+  $('checkout-modal').classList.add('hidden');
+  renderCart();
+  $('pay-confirm').disabled = false;
+  try {
     await loadCatalog();
     renderPos();
     // low-stock heads-up for what was just sold
@@ -536,23 +603,20 @@ async function confirmSale(bankRef) {
     soldItems.forEach((it) => {
       const p = products.find((x) => x.id === it.product_id);
       if (!p) return;
+      const gThr = parseFloat(settings.low_stock_threshold);
       const thr = p.reorder_level > 0 ? p.reorder_level
-        : (parseFloat(settings.low_stock_threshold || '10') || 10);
+        : (isNaN(gThr) ? 10 : gThr);
       if (p.stock_qty <= thr) lowNames.push(p.name + '（库存 ' + p.stock_qty + '）');
     });
     if (lowNames.length) toast('缺货提醒 / Low stock: ' + lowNames.join('、'), 4200);
-    if (payMethod === 'CASH' && d.change_cents > 0) {
-      $('change-lines').textContent =
-        '收取 / Tendered ' + fmt(pendingSale.paid_cents) + '\n应付 / Due ' + fmt(d.total_cents);
-      $('change-amt').textContent = fmt(d.change_cents);
-      $('change-modal').classList.remove('hidden');
-    } else {
-      showSuccess();
-    }
-  } catch (e) {
-    toast('结账失败：' + e.message);
-  } finally {
-    $('pay-confirm').disabled = false;
+  } catch (_) { /* catalog refresh is best-effort; the sale stands */ }
+  if (payMethod === 'CASH' && d.change_cents > 0) {
+    $('change-lines').textContent =
+      '收取 / Tendered ' + fmt(pendingSale.paid_cents) + '\n应付 / Due ' + fmt(d.total_cents);
+    $('change-amt').textContent = fmt(d.change_cents);
+    $('change-modal').classList.remove('hidden');
+  } else {
+    showSuccess();
   }
 }
 function showSuccess() {
@@ -564,11 +628,28 @@ function showSuccess() {
 }
 
 /* ---------------- products ---------------- */
+let mgmtProducts = null;
+
+async function refreshMgmtProducts() {
+  if ($('prod-show-inactive').checked) {
+    try {
+      const d = await api('/api/products?include_inactive=1');
+      mgmtProducts = d.items || [];
+    } catch (e) {
+      toast('载入失败：' + e.message);
+      mgmtProducts = null;
+    }
+  } else {
+    mgmtProducts = null;
+  }
+  renderProducts();
+}
+
 function renderProducts() {
   const q = $('prod-search').value.trim().toLowerCase();
   const box = $('prod-list');
   box.innerHTML = '';
-  products
+  (mgmtProducts || products)
     .filter((p) => !q || p.name.toLowerCase().includes(q) ||
       (p.barcode || '').includes(q))
     .forEach((p) => {
@@ -578,6 +659,7 @@ function renderProducts() {
         '<span class="grow"><span class="t">' + esc(p.name) + '</span>' +
         '<span class="s">' + esc(p.category_name || '未分类') +
         (p.barcode ? ' · ' + esc(p.barcode) : '') + '</span></span>' +
+        (p.is_active ? '' : '<span class="badge low">已下架</span>') +
         (p.low_stock ? '<span class="badge low">低库存</span>' : '') +
         '<span class="s">库存 ' + p.stock_qty + '</span>' +
         '<span class="amt">' + fmt(p.price_cents) + '</span>';
@@ -731,18 +813,27 @@ async function loadSales() {
 async function loadToday() {
   const day = new Date().toLocaleDateString('sv-SE');
   try {
-    const d = await api('/api/sales?date=' + day + '&limit=200');
     const box = $('today-list');
     box.innerHTML = '';
-    let sum = 0, count = 0;
-    (d.items || []).forEach((s) => {
-      if (s.is_void) return;  // the Today page excludes voided sales entirely
-      box.appendChild(saleRowEl(s));
-      if (!s.is_training) { sum += s.total_cents; count += 1; }
-    });
+    // page through every sale of the day (the old single limit=200 fetch
+    // silently under-reported busy days)
+    let offset = 0;
+    for (;;) {
+      const d = await api('/api/sales?date=' + day +
+        '&limit=500&offset=' + offset);
+      const items = d.items || [];
+      items.forEach((s) => {
+        if (s.is_void) return;  // Today excludes voided sales entirely
+        box.appendChild(saleRowEl(s));
+      });
+      if (items.length < 500 || offset > 5000) break;
+      offset += 500;
+    }
     if (!box.children.length)
       box.innerHTML = '<div class="cart-empty">今天还没有销售</div>';
-    $('today-summary').textContent = '今日 ' + count + ' 单 · ' + fmt(sum);
+    const dash = await api('/api/dashboard');
+    $('today-summary').textContent =
+      '今日 ' + dash.tickets + ' 单 · ' + fmt(dash.sales_total_cents);
   } catch (e) { toast('载入今日销售失败：' + e.message); }
 }
 
@@ -777,7 +868,7 @@ async function openSale(id) {
 async function voidSale() {
   if (!currentSaleId) return;
   if (!confirm('确定作废这一单？库存会加回去。')) return;
-  const note = prompt('作废备注（可留空）：', '');
+  const note = await uiPrompt('作废备注（可留空）', '');
   if (note === null) return;
   try {
     await api('/api/sales/' + currentSaleId + '/void', {
@@ -913,9 +1004,13 @@ async function importQr(file) {
     });
     const payload = (d.payload || '').trim();
     if (!payload || !emvIsValid(payload)) { toast('这张图识别出的不是有效的 DuitNow 码'); return; }
+    const pin = await uiPrompt('保存收款码需要管理员本人 PIN', '',
+      { password: true, inputmode: 'numeric' });
+    if (!pin) { toast('已取消保存收款码'); return; }
     await api('/api/settings', {
       method: 'POST',
-      body: JSON.stringify({ settings: { duitnow_qr_payload: payload } }),
+      body: JSON.stringify({ settings: { duitnow_qr_payload: payload },
+        admin_pin: pin }),
     });
     await refreshSettings();
     renderQrStatus();
@@ -1115,6 +1210,56 @@ function closePinModal() {
   $('pin-modal').classList.add('hidden');
 }
 
+/* ---------------- in-app prompt / choose (window.prompt is unavailable
+   inside the Electron shell, so every prompt goes through this modal) -- */
+let askResolve = null;
+
+function closeAsk(v) {
+  $('ask-modal').classList.add('hidden');
+  if (askResolve) { const r = askResolve; askResolve = null; r(v); }
+}
+
+function uiPrompt(title, defVal, opts) {
+  opts = opts || {};
+  return new Promise((resolve) => {
+    askResolve = resolve;
+    $('ask-title').textContent = title;
+    $('ask-msg').textContent = opts.msg || '';
+    $('ask-choices').classList.add('hidden');
+    $('ask-choices').innerHTML = '';
+    $('ask-input-wrap').classList.remove('hidden');
+    $('ask-ok').classList.remove('hidden');
+    const inp = $('ask-input');
+    inp.type = opts.password ? 'password' : 'text';
+    if (opts.inputmode) inp.setAttribute('inputmode', opts.inputmode);
+    else inp.removeAttribute('inputmode');
+    inp.value = defVal != null ? String(defVal) : '';
+    $('ask-modal').classList.remove('hidden');
+    setTimeout(() => { try { inp.focus(); inp.select(); } catch (_) {} }, 40);
+  });
+}
+
+function uiChoose(title, options, msg) {
+  return new Promise((resolve) => {
+    askResolve = resolve;
+    $('ask-title').textContent = title;
+    $('ask-msg').textContent = msg || '';
+    $('ask-input-wrap').classList.add('hidden');
+    $('ask-ok').classList.add('hidden');
+    const box = $('ask-choices');
+    box.innerHTML = '';
+    box.classList.remove('hidden');
+    options.forEach((o) => {
+      const b = document.createElement('button');
+      b.className = 'btn big';
+      b.textContent = o.label;
+      b.onclick = () => closeAsk(o.value);
+      box.appendChild(b);
+    });
+    $('ask-modal').classList.remove('hidden');
+  });
+}
+
 async function genProductBarcode() {
   const id = $('prod-id').value;
   if (!id) { toast('请先保存商品，再生成条码'); return; }
@@ -1232,7 +1377,7 @@ function renderCategoriesPage() {
       '<button class="btn small" data-act="rename">改名</button>' +
       '<button class="btn small danger" data-act="del">删除</button>';
     row.querySelector('[data-act="rename"]').onclick = async () => {
-      const name = prompt('分类新名称', c.name);
+      const name = await uiPrompt('分类新名称', c.name);
       if (!name || !name.trim() || name.trim() === c.name) return;
       try {
         await api('/api/categories', { method: 'POST',
@@ -1351,20 +1496,49 @@ function wipeCountsText(counts) {
     return (c ? c[1] : k) + '：' + counts[k];
   }).join('；');
 }
-async function runWipe(cats, dry) {
+async function runWipe(cats, dry, pin) {
   return api('/api/admin/wipe', { method: 'POST',
-    body: JSON.stringify({ categories: cats, dry_run: dry }) });
+    body: JSON.stringify({ categories: cats, dry_run: dry,
+      pin: pin || undefined }) });
 }
 async function wipeFlow(cats) {
   if (!cats.length) { toast('先勾选要清零的类别'); return; }
   try {
     const dry = await runWipe(cats, true);
     if (!confirm('将清零以下数据，确定？\n' + wipeCountsText(dry.counts))) return;
-    const done = await runWipe(cats, false);
-    $('wipe-result').textContent = '已清零：' + wipeCountsText(done.counts);
+    const pin = await uiPrompt('清零需要管理员本人 PIN', '',
+      { password: true, inputmode: 'numeric' });
+    if (!pin) return;
+    const done = await runWipe(cats, false, pin);
+    $('wipe-result').textContent = '已清零：' + wipeCountsText(done.counts) +
+      (done.backup ? '（清零前自动备份：' + done.backup + '）' : '');
     toast('清零完成');
     await loadCatalog(); renderPos();
   } catch (e) { toast('清零失败：' + e.message); }
+}
+
+async function restoreFlow(file) {
+  if (!file) return;
+  let backup;
+  try { backup = JSON.parse(await file.text()); }
+  catch (_) { toast('备份文件不是有效的 JSON'); return; }
+  if (!backup.tables || !backup.tables.users) {
+    toast('备份无效：缺少数据表');
+    return;
+  }
+  if (!confirm('还原将覆盖当前全部数据（账号也会换成备份里的），确定？')) return;
+  const pin = await uiPrompt('还原需要管理员本人 PIN', '',
+    { password: true, inputmode: 'numeric' });
+  if (!pin) return;
+  try {
+    const d = await api('/api/admin/restore', {
+      method: 'POST', body: JSON.stringify({ backup, pin }),
+    });
+    $('restore-result').textContent =
+      '已还原。还原前自动快照：' + (d.backup_snapshot || '');
+    toast('还原完成，请重新登录');
+    logout(false);
+  } catch (e) { toast('还原失败：' + e.message); }
 }
 
 /* ---------------- training ---------------- */
@@ -1504,12 +1678,12 @@ async function shareEReceipt(saleId) {
     const sale = d.sale;
     const items = d.items || [];
     if (!sale.customer_phone) {
-      const phone = prompt('电子收据手机号 / Phone（电子收据）', '');
+      const phone = await uiPrompt('电子收据手机号 / Phone（电子收据）', '', { inputmode: 'tel' });
       if (phone === null) return;
       if (phone.trim()) {
         sale.customer_phone = phone.trim();
         if (!sale.customer_id && confirm('保存为客户？')) {
-          const name = prompt('客户姓名 / Name', sale.customer_name || '');
+          const name = await uiPrompt('客户姓名 / Name', sale.customer_name || '');
           if (name && name.trim()) {
             await api('/api/customers', { method: 'POST', body: JSON.stringify(
               { name: name.trim(), phone: phone.trim() }) });
@@ -2143,8 +2317,8 @@ async function commitDraftFlow() {
       d = await doCommit();
     } catch (e) {
       if (!/重复进货单号/.test(e.message)) throw e;
-      const reason = prompt('同一供应商已存在这个进货单号。\n' +
-        '管理员强制入库必须填原因（会记入审计）：');
+      const reason = await uiPrompt('同一供应商已存在这个进货单号', '',
+        { msg: '管理员强制入库必须填原因（会记入审计）' });
       if (!reason || !reason.trim()) { toast('已取消入库'); return; }
       d = await doCommit({ allow_duplicate: true, override_reason: reason.trim() });
     }
@@ -2279,12 +2453,31 @@ function init() {
     showPayPane();
   });
   document.addEventListener('pointerdown', primeSpeech, { once: true });
-  $('pay-paid').addEventListener('input', updateChange);
+  $('pay-paid').addEventListener('input', () => {
+    $('pay-paid').dataset.touched = '1';
+    updateChange();
+  });
+  $('ask-ok').onclick = () => closeAsk($('ask-input').value);
+  $('ask-cancel').onclick = () => closeAsk(null);
+  $('ask-input').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') $('ask-ok').click();
+  });
   document.querySelectorAll('.quick-cash button').forEach((b) => b.onclick = () => {
-    const { total } = cartTotals();
-    $('pay-paid').value = b.dataset.amt === 'exact'
-      ? (total / 100).toFixed(2)
-      : ((Math.round(parseFloat($('pay-paid').value || '0') * 100) + parseInt(b.dataset.amt) * 100) / 100).toFixed(2);
+    // Quick-cash keys name the note the customer hands over. The paid box
+    // is prefilled with the amount due, so the FIRST tap must replace that
+    // prefill with the note value (tapping 50 on a RM3.80 sale tenders
+    // RM50, change RM46.20) — only later taps stack more notes on top.
+    const el = $('pay-paid');
+    if (b.dataset.amt === 'exact') {
+      const { total } = cartTotals();
+      el.value = (total / 100).toFixed(2);
+    } else if (!el.dataset.touched) {
+      el.value = parseInt(b.dataset.amt, 10).toFixed(2);
+    } else {
+      el.value = ((Math.round(parseFloat(el.value || '0') * 100) +
+        parseInt(b.dataset.amt, 10) * 100) / 100).toFixed(2);
+    }
+    el.dataset.touched = '1';
     updateChange();
   });
   $('pay-confirm').onclick = () => { const r = autoRef; confirmSale(r); };
@@ -2293,6 +2486,7 @@ function init() {
     $(b.dataset.close).classList.add('hidden');
   });
   $('prod-search').addEventListener('input', renderProducts);
+  $('prod-show-inactive').addEventListener('change', refreshMgmtProducts);
   $('prod-add').onclick = () => openProduct(null);
   $('prod-import').onclick = openImport;
   $('imp-file').addEventListener('change', onImportFile);
@@ -2327,7 +2521,7 @@ function init() {
   };
   $('prod-label').onclick = printProductLabel;
   $('cat-add').onclick = async () => {
-    const name = prompt('新分类名称');
+    const name = await uiPrompt('新分类名称', '');
     if (!name || !name.trim()) return;
     try {
       await api('/api/categories', { method: 'POST', body: JSON.stringify({ name: name.trim() }) });
@@ -2490,10 +2684,17 @@ function init() {
   };
   $('wipe-txn-btn').onclick = () =>
     wipeFlow(['sales', 'purchases', 'stock_moves', 'held_orders', 'daily_closings']);
+  $('restore-btn').onclick = () => $('restore-file').click();
+  $('restore-file').addEventListener('change', (e) => {
+    restoreFlow(e.target.files[0]);
+    e.target.value = '';
+  });
   $('prod-queue').onclick = async () => {
     const id = $('prod-id').value;
     if (!id) { toast('先保存商品，再加入条码队列'); return; }
-    const copies = Math.max(1, parseInt(prompt('入队份数', '1') || '1', 10) || 1);
+    const cv = await uiPrompt('入队份数', '1', { inputmode: 'numeric' });
+    if (cv === null) return;
+    const copies = Math.max(1, parseInt(cv || '1', 10) || 1);
     try {
       await api('/api/barcode-queue', { method: 'POST',
         body: JSON.stringify({ product_id: parseInt(id), copies }) });
@@ -2508,9 +2709,13 @@ function init() {
   $('qr-file').addEventListener('change', (e) => { importQr(e.target.files[0]); e.target.value = ''; });
   $('qr-clear').onclick = async () => {
     if (!confirm('移除服务器上的收款码载荷？')) return;
+    const pin = await uiPrompt('移除收款码需要管理员本人 PIN', '',
+      { password: true, inputmode: 'numeric' });
+    if (!pin) return;
     try {
       await api('/api/settings', {
-        method: 'POST', body: JSON.stringify({ settings: { duitnow_qr_payload: '' } }),
+        method: 'POST', body: JSON.stringify({
+          settings: { duitnow_qr_payload: '' }, admin_pin: pin }),
       });
       await refreshSettings(); renderQrStatus(); toast('已移除');
     } catch (e) { toast('移除失败：' + e.message); }
@@ -2606,7 +2811,7 @@ function connectWs() {
     let msg;
     try { msg = JSON.parse(ev.data); } catch (_) { return; }
     if (msg.type === 'payment' && msg.payment) handlePayment(msg.payment);
-    if (msg.type === 'sale') {
+    if (msg.type === 'sale' || msg.type === 'catalog') {
       clearTimeout(catalogReloadTimer);
       catalogReloadTimer = setTimeout(async () => {
         try { await loadCatalog(); renderPos(); } catch (_) { /* offline blip */ }
@@ -2659,8 +2864,23 @@ function handlePayment(p) {
   }
 }
 
-function startAuto(p, box) {
+async function startAuto(p, box) {
   stopAuto();
+  // Claim the ref on the server first: with several tills open, only the
+  // first device to claim may auto-settle this arrival — the rest are
+  // told it is already being handled, so one payment can never post
+  // the same sale twice.
+  try {
+    const c = await api('/api/payments/claim', {
+      method: 'POST', body: JSON.stringify({ ref_no: p.ref_no }),
+    });
+    if (!c.claimed) {
+      const note = $('pay-qr-note');
+      if (note) note.textContent =
+        '这笔到账已在其他设备处理 / Already handled on another device.';
+      return;
+    }
+  } catch (_) { /* claim service unreachable: fall back to local-only */ }
   autoRef = p.ref_no;
   let remain = 5;
   box = box || $('pay-auto');
@@ -2671,7 +2891,13 @@ function startAuto(p, box) {
       '<button id="auto-no">不是这单</button></div>';
     $('auto-now').onclick = () => { const r = autoRef; confirmSale(r); };
     $('auto-no').onclick = () => {
+      const r = autoRef;
       stopAuto();
+      if (r) {
+        api('/api/payments/release', {
+          method: 'POST', body: JSON.stringify({ ref_no: r }),
+        }).catch(() => {});
+      }
       $('pay-qr-note').textContent = '已忽略这笔到账，请核对后再确认收款。';
     };
   };
@@ -2776,9 +3002,10 @@ function openHeld() {
     row.className = 'li';
     row.innerHTML =
       '<span class="grow"><span class="t">' + esc(h.hold_no) + ' · ' +
-      items.map((it) => esc(it.name) + '×' + it.qty).join('，') +
+      items.map((it) => esc(it.name) + '×' + esc(String(it.qty))).join('，') +
       '</span><span class="s">' + esc((h.created_at || '').replace('T', ' ').slice(0, 19)) +
-      ' · ' + esc(h.cashier) + '</span></span>' +
+      ' · ' + esc(h.cashier) + (h.overdue ? ' · <b>已超时</b>' : '') +
+      '</span></span>' +
       '<span class="amt">' + fmt(Math.max(0, total)) + '</span>';
     const resume = document.createElement('button');
     resume.className = 'replay';
@@ -2811,9 +3038,13 @@ async function resumeHeld(h) {
   } catch (e) { toast('取单失败：' + e.message); return; }
   cart.clear();
   (payload.items || []).forEach((it) => {
-    cart.set(it.product_id, {
-      p: { id: it.product_id, name: it.name, price_cents: it.price_cents, _snap: true },
-      qty: it.qty, disc: it.discount_cents || 0,
+    const pid = parseInt(it.product_id, 10);
+    const qty = parseFloat(it.qty);
+    if (!isFinite(pid) || !isFinite(qty) || qty <= 0) return;
+    cart.set(pid, {
+      p: { id: pid, name: String(it.name || ''),
+        price_cents: parseInt(it.price_cents, 10) || 0, _snap: true },
+      qty, disc: parseInt(it.discount_cents, 10) || 0,
     });
   });
   $('cart-discount').value = ((payload.discount_cents || 0) / 100).toFixed(2);
@@ -2836,11 +3067,12 @@ let custOutstanding = {};
 async function fillCustomerSelect() {
   try { await loadCustomers(); } catch (_) { /* keep cache */ }
   try {
-    const d = await api('/api/credits');
+    const d = await api('/api/credit');
     custOutstanding = {};
     (d.items || []).forEach((r) => {
       custOutstanding[r.customer_id] =
-        (custOutstanding[r.customer_id] || 0) + r.outstanding_cents;
+        (custOutstanding[r.customer_id] || 0) +
+        (r.total_cents - r.paid_cents);
     });
   } catch (_) { /* warning is best-effort */ }
   const sel = $('co-customer');
@@ -2923,14 +3155,21 @@ async function loadCustomersPage() {
       btn.className = 'replay';
       btn.textContent = '还款';
       btn.onclick = async () => {
-        const v = prompt('还款金额 RM（欠 ' + (due / 100).toFixed(2) + '）',
-          (due / 100).toFixed(2));
+        const v = await uiPrompt('还款金额 RM（欠 ' + (due / 100).toFixed(2) + '）',
+          (due / 100).toFixed(2), { inputmode: 'decimal' });
         if (v === null) return;
         const cents = Math.round(parseFloat(v || '0') * 100);
         if (!cents || cents <= 0) { toast('金额不正确'); return; }
+        const m = await uiChoose('还款方式 / Repay method', [
+          { label: '现金 Cash', value: 'CASH' },
+          { label: 'DuitNow', value: 'DUITNOW' },
+          { label: '刷卡 Card', value: 'CARD' },
+        ]);
+        if (!m) return;
         try {
           const r = await api('/api/credit/' + s.id + '/repay', {
-            method: 'POST', body: JSON.stringify({ amount_cents: cents }),
+            method: 'POST',
+            body: JSON.stringify({ amount_cents: cents, method: m }),
           });
           toast(r.remaining_cents ? '已还款，剩 ' + fmt(r.remaining_cents) : '已结清 ✅');
           loadCustomersPage();
@@ -3178,12 +3417,14 @@ function renderSupplierRows() {
 }
 
 function fillSupplierSelect(sel) {
+  const keep = sel.value;
   sel.innerHTML = '<option value="">（无供应商）</option>';
   suppliers.forEach((s) => {
     const o = document.createElement('option');
     o.value = s.id; o.textContent = s.name;
     sel.appendChild(o);
   });
+  if (keep) sel.value = keep;
 }
 
 function openSupplier(s) {
@@ -3340,53 +3581,6 @@ async function confirmReverse() {
     await loadCatalog();
     loadPurchasesPage();
   } catch (e) { toast('撤销失败：' + e.message); }
-}
-
-/* OCR invoice line parser: pull product rows out of the raw OCR text.
-   Handles "NAME qty x price total", "NAME qty total" and "NAME RM amount".
-   Header/total/tax lines are skipped; names are matched to the catalog. */
-function parseInvoiceLines(text) {
-  const SKIP = /(total|sub\s*total|tax|gst|sst|vat|change|cash|amount due|balance|invoice|date|tel|fax|thank|rounding|tender|items? sold|grand)/i;
-  const out = [];
-  (text || '').split(/\r?\n/).forEach((raw) => {
-    const line = raw.replace(/\s+/g, ' ').trim();
-    if (line.length < 4 || SKIP.test(line)) return;
-    let m = line.match(/^(.*?)\s+(\d+(?:\.\d+)?)\s*[xX×]\s*(?:RM\s*)?(\d+(?:\.\d{1,2})?)\s+(?:RM\s*)?(\d+(?:\.\d{1,2})?)\s*$/);
-    if (m) {
-      out.push({ name: m[1], qty: parseFloat(m[2]), cost: Math.round(parseFloat(m[3]) * 100) });
-      return;
-    }
-    m = line.match(/^(.*?)\s+(\d+(?:\.\d+)?)\s+(?:RM\s*)?(\d+(?:\.\d{1,2})?)\s*$/);
-    if (m && parseFloat(m[2]) > 0) {
-      const q = parseFloat(m[2]);
-      out.push({ name: m[1], qty: q, cost: Math.round((parseFloat(m[3]) * 100) / q) });
-      return;
-    }
-    m = line.match(/^(.*?)\s+(?:RM\s*)(\d+(?:\.\d{1,2})?)\s*$/);
-    if (m) out.push({ name: m[1], qty: 1, cost: Math.round(parseFloat(m[2]) * 100) });
-  });
-  return out.filter((i) => i.name.replace(/[^A-Za-z0-9]/g, '').length >= 2 && i.cost > 0 && i.qty > 0);
-}
-
-function matchProduct(name) {
-  const norm = (s) => (s || '').toUpperCase().replace(/[^A-Z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
-  const n = norm(name);
-  if (!n) return null;
-  let best = null, bestScore = 0;
-  products.forEach((p) => {
-    const pn = norm(p.name);
-    if (!pn) return;
-    let score = 0;
-    if (pn === n) score = 100;
-    else if (pn.includes(n) || n.includes(pn)) score = 60;
-    else {
-      const words = n.split(' ').filter((w) => w.length >= 2);
-      const hit = words.filter((w) => pn.includes(w)).length;
-      score = words.length ? Math.round((hit / words.length) * 50) : 0;
-    }
-    if (score > bestScore) { bestScore = score; best = p; }
-  });
-  return bestScore >= 40 ? best : null;
 }
 
 function addPurLine(preset) {
@@ -3762,6 +3956,7 @@ async function purchaseOcr(file) {
     openDraftPage(draftId);
   } catch (e) {
     $('pur-ocr-status').textContent = '识别失败：' + e.message;
+    toast('OCR 识别失败：' + e.message, 4200);
   }
 }
 
@@ -3926,12 +4121,14 @@ async function exportLabelsPdf(items) {
   }
 }
 
-function printProductLabel() {
+async function printProductLabel() {
   const name = $('prod-name').value.trim();
   const code = ($('prod-barcode').value.trim() || $('prod-sku').value.trim());
   if (!name) { toast('先填商品名'); return; }
   if (!code) { toast('这个商品没有条码/SKU，没法打印条码标签'); return; }
-  const n = Math.max(1, Math.min(50, parseInt(prompt('打印几张标签？', '1') || '1', 10) || 1));
+  const nv = await uiPrompt('打印几张标签？', '1', { inputmode: 'numeric' });
+  if (nv === null) return;
+  const n = Math.max(1, Math.min(50, parseInt(nv || '1', 10) || 1));
   printLabelsHtml(labelHtml(name, code).repeat(n));
 }
 
