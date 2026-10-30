@@ -21,6 +21,7 @@ label.check input{width:auto}
 .btn.primary{background:var(--brand2); border-color:var(--brand2); color:#fff; font-weight:600}
 .btn.danger{background:#fff; border-color:#f0b7b7; color:var(--danger)}
 .btn.ghost{background:transparent; color:#fff; border-color:rgba(255,255,255,.4)}
+.btn.btn-ghost{background:transparent; color:var(--ink); border:1px solid var(--line)}
 .btn.small{padding:5px 10px; font-size:13px}
 .btn.big{width:100%; padding:13px; font-size:16px; margin-top:12px}
 .btn:disabled{opacity:.45; cursor:not-allowed}
@@ -113,8 +114,8 @@ main{max-width:1240px; margin:0 auto; padding:14px}
 .imp-preview{max-height:46vh; overflow:auto; margin:10px 0}
 .imp-preview table{width:100%; border-collapse:collapse; font-size:13px}
 .imp-preview th,.imp-preview td{border-bottom:1px solid var(--line); padding:5px 6px; text-align:left; white-space:nowrap}
-.imp-preview th{color:var(--mut); font-weight:600}
-.imp-tag{font-size:11px; padding:2px 7px; border-radius:999px; background:#eef1f5; color:var(--mut)}
+.imp-preview th{color:var(--muted); font-weight:600}
+.imp-tag{font-size:11px; padding:2px 7px; border-radius:999px; background:#eef1f5; color:var(--muted)}
 .imp-tag.gen{background:#fdf3d7; color:#92600a}
 .imp-tag.skip{background:#fde8e8; color:#b3002d}
 .imp-tag.warn{background:#fdeeda; color:#92600a}
@@ -246,7 +247,7 @@ main{max-width:1240px; margin:0 auto; padding:14px}
 .qr-full-amt{font-size:40px;font-weight:800;color:var(--brand)}
 .qr-full-box{background:#fff;padding:8px 18px 0}
 .qr-full-box svg{width:min(70vw,340px);height:auto;display:block}
-.qr-full-note{color:var(--mut)}
+.qr-full-note{color:var(--muted)}
 .qr-standee{border:3px solid var(--brand);border-radius:16px;background:#fff;overflow:hidden;padding-bottom:10px;margin-bottom:8px}
 .qs-band{background:var(--brand);color:#fff;font-weight:800;letter-spacing:2px;text-align:center;padding:7px 0;font-size:16px}
 .qr-full-card .qs-band{align-self:stretch;font-size:19px;padding:9px 0}
