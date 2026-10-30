@@ -149,6 +149,7 @@
       <button class="btn small hub-back">← 管理中心</button>
       <div class="page-tools">
         <input id="prod-search" type="search" placeholder="搜索商品">
+        <label class="hint"><input type="checkbox" id="prod-show-inactive"> 显示已下架</label>
         <button id="prod-add" class="btn primary">+ 新增商品</button>
         <button id="prod-import" class="btn">📥 导入商品</button>
         <button id="prod-pdf" class="btn">📄 条码PDF</button>
@@ -245,6 +246,15 @@
         </div>
         <div id="wipe-result" class="hint"></div>
         <p class="hint">账号永不清零。收款账本清零会经银行邮件流水线服务执行，并留标记防止旧记录被回扫复活。</p>
+      </div>
+      <div class="card">
+        <h3>从备份还原</h3>
+        <p class="hint">选择之前导出的 pos2-backup.json 全量备份。还原会覆盖当前全部数据（账号也会换成备份里的），需要管理员本人 PIN；执行前系统会自动给当前数据留一份快照。</p>
+        <div class="row gap">
+          <button id="restore-btn" class="btn danger">选择备份文件并还原…</button>
+          <input id="restore-file" type="file" accept=".json,application/json" class="hidden">
+        </div>
+        <div id="restore-result" class="hint"></div>
       </div>
     </section>
 
@@ -552,6 +562,18 @@
     <label>管理员 PIN <input id="pin-modal-input" type="password" inputmode="numeric" maxlength="12" autocomplete="off"></label>
     <button id="pin-modal-ok" class="btn primary big">确认</button>
     <button id="pin-modal-cancel" class="btn big">取消</button>
+  </div>
+</div>
+
+<!-- ======================= ASK (prompt/choose) MODAL ======================= -->
+<div id="ask-modal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-head"><span id="ask-title">请输入</span></div>
+    <p class="hint" id="ask-msg"></p>
+    <label id="ask-input-wrap"><input id="ask-input" type="text" autocomplete="off"></label>
+    <div id="ask-choices" class="rowb hidden"></div>
+    <button id="ask-ok" class="btn primary big">确定</button>
+    <button id="ask-cancel" class="btn big">取消</button>
   </div>
 </div>
 
