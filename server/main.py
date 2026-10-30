@@ -10,6 +10,7 @@ Design rules (learned from the previous system):
 """
 import asyncio
 import base64
+import glob
 import hashlib
 import json
 import math
@@ -25,6 +26,7 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
@@ -38,6 +40,8 @@ SYNC_TOKEN = os.environ.get("POS2_SYNC_TOKEN", "")
 TOKEN_HDR = "X-CNKH-" + "Token"
 KL = timezone(timedelta(hours=8))
 
+os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+
 PBKDF2_ITERS = 210_000
 SESSION_DAYS = 30
 
@@ -50,10 +54,30 @@ SETTING_KEYS = {
     "receipt_show_unit_price", "receipt_show_qty", "receipt_show_duitnow_qr",
     "low_stock_threshold", "duitnow_qr_payload", "training_mode",
     "stock_policy", "hold_timeout_minutes", "product_images_enabled",
+    "discount_pin_above_cents",
     "scan_feedback", "bt_printer_enabled",
 }
 
 app = FastAPI(title="CNKH POS 2.0")
+
+
+@app.middleware("http")
+async def _json_object_guard(request: Request, call_next):
+    if request.method in ("POST", "PUT", "PATCH") \
+            and request.url.path.startswith("/api/") \
+            and "application/json" in request.headers.get(
+                "content-type", ""):
+        raw = await request.body()
+        if raw:
+            try:
+                if not isinstance(json.loads(raw), dict):
+                    return JSONResponse(
+                        status_code=400,
+                        content={"detail":
+                                 "request body must be a JSON object"})
+            except Exception:
+                pass  # malformed JSON is rejected downstream as a 400
+    return await call_next(request)
 
 
 # ---------------------------------------------------------------- DB ----
@@ -268,6 +292,7 @@ def seed(c):
         "scan_feedback": "beep",
         "product_images_enabled": "0",
         "bt_printer_enabled": "0",
+        "discount_pin_above_cents": "5000",
         "duitnow_qr_payload": "",
     }
     for k, v in defaults.items():
@@ -380,16 +405,33 @@ def _int_or_400(value, field):
 _LOGIN_FAILS = {}
 
 
-def _check_login_lock(username):
+def _login_lock_key(req, username):
+    # Lock per (source, username): five wrong PINs from one device must
+    # not lock the admin out of every other till, and probing unknown
+    # usernames must not grow the table without bound.
+    xff = req.headers.get("x-forwarded-for", "")
+    src = xff.split(",")[0].strip() if xff else (
+        req.client.host if req.client else "?")
+    return src + "|" + username
+
+
+def _check_login_lock(key):
     now = time.time()
-    fails = [t for t in _LOGIN_FAILS.get(username, []) if now - t < 300]
-    _LOGIN_FAILS[username] = fails
+    fails = [t for t in _LOGIN_FAILS.get(key, []) if now - t < 300]
+    if fails:
+        _LOGIN_FAILS[key] = fails
+    else:
+        _LOGIN_FAILS.pop(key, None)
+    if len(_LOGIN_FAILS) > 1000:
+        for k in [k for k, v in _LOGIN_FAILS.items()
+                  if not v or now - v[-1] > 300]:
+            _LOGIN_FAILS.pop(k, None)
     if len(fails) >= 5:
         raise HTTPException(429, "PIN 尝试次数过多，请 5 分钟后再试")
 
 
-def _record_login_fail(username):
-    _LOGIN_FAILS.setdefault(username, []).append(time.time())
+def _record_login_fail(key):
+    _LOGIN_FAILS.setdefault(key, []).append(time.time())
 
 
 @app.post("/api/auth/login")
@@ -397,29 +439,38 @@ async def login(req: Request):
     body = await req.json()
     username = str(body.get("username", "")).strip()
     pin = str(body.get("pin", ""))
-    _check_login_lock(username)
+    lock_key = _login_lock_key(req, username)
+    _check_login_lock(lock_key)
     with db() as c:
         row = c.execute(
             "SELECT * FROM users WHERE username=? AND is_active=1", (username,)
         ).fetchone()
-        if not row or not verify_pin(pin, row["pin_salt"], row["pin_hash"]):
-            _record_login_fail(username)
-            raise HTTPException(401, "账号或 PIN 不正确")
-        _LOGIN_FAILS.pop(username, None)
-        token = secrets.token_urlsafe(32)
+        row = dict(row) if row else None
+    # PBKDF2 (210k rounds, ~100ms) must not run on the event loop while
+    # holding the global DB lock — verify in the threadpool instead
+    ok = False
+    if row:
+        ok = await run_in_threadpool(
+            verify_pin, pin, row["pin_salt"], row["pin_hash"])
+    if not row or not ok:
+        _record_login_fail(lock_key)
+        raise HTTPException(401, "账号或 PIN 不正确")
+    _LOGIN_FAILS.pop(lock_key, None)
+    token = secrets.token_urlsafe(32)
+    with db() as c:
         c.execute(
             "INSERT INTO sessions(token,user_id,expires_at) VALUES(?,?,?)",
             (token, row["id"], time.time() + SESSION_DAYS * 86400),
         )
-        return {
-            "ok": True,
-            "token": token,
-            "user": {
-                "username": row["username"],
-                "display_name": row["display_name"],
-                "role": row["role"],
-            },
-        }
+    return {
+        "ok": True,
+        "token": token,
+        "user": {
+            "username": row["username"],
+            "display_name": row["display_name"],
+            "role": row["role"],
+        },
+    }
 
 
 @app.post("/api/auth/logout")
@@ -497,6 +548,12 @@ async def upsert_user(req: Request, authorization: str = Header(default="")):
             if sets:
                 args.append(row["id"])
                 c.execute(f"UPDATE users SET {','.join(sets)} WHERE id=?", args)
+            if pin or (body.get("is_active") is not None
+                       and not body["is_active"]):
+                # a changed/reset PIN (or a deactivation) must kill every
+                # existing session for that user immediately
+                c.execute("DELETE FROM sessions WHERE user_id=?",
+                          (row["id"],))
         else:
             if not pin:
                 raise HTTPException(400, "新用户必须设置 PIN")
@@ -544,6 +601,7 @@ async def upsert_category(req: Request, authorization: str = Header(default=""))
                 (name, int(body.get("sort", 0))),
             )
             cid = cur.lastrowid
+    push_event({"type": "catalog"})
     return {"ok": True, "id": cid}
 
 
@@ -559,6 +617,7 @@ def delete_category(cid: int, authorization: str = Header(default="")):
         moved = c.execute(
             "UPDATE products SET category_id=NULL WHERE category_id=?",
             (cid,)).rowcount
+    push_event({"type": "catalog"})
     return {"ok": True, "products_uncategorized": moved}
 
 
@@ -571,7 +630,7 @@ def product_dict(r):
 @app.get("/api/products")
 def list_products(authorization: str = Header(default=""), search: str = "",
                   category: int = 0, include_inactive: int = 0):
-    current_user(authorization)
+    user = current_user(authorization)
     sql = "SELECT p.*, cat.name category_name," \
           " (SELECT 1 FROM product_images pi WHERE pi.product_id=p.id) has_image" \
           " FROM products p" \
@@ -591,13 +650,19 @@ def list_products(authorization: str = Header(default=""), search: str = "",
             "SELECT value FROM settings WHERE key='low_stock_threshold'"
         ).fetchone()
     try:
-        threshold = float(thr["value"]) if thr and thr["value"] else 5.0
+        threshold = float(thr["value"]) if thr and thr["value"] else 10.0
     except (TypeError, ValueError):
-        threshold = 5.0
+        threshold = 10.0
     items = []
     for r in rows:
         d = product_dict(r)
-        d["low_stock"] = 1 if d["stock_qty"] <= threshold else 0
+        # a product's own reorder level wins over the global threshold
+        own_thr = float(d.get("reorder_level") or 0)
+        d["low_stock"] = 1 if d["stock_qty"] <= (
+            own_thr if own_thr > 0 else threshold) else 0
+        if user["role"] != "ADMIN":
+            # cost is margin data; tills only need price and stock
+            d["cost_cents"] = None
         items.append(d)
     return {"ok": True, "items": items}
 
@@ -627,6 +692,15 @@ async def upsert_product(req: Request, authorization: str = Header(default="")):
         except (TypeError, ValueError):
             raise HTTPException(400, "reorder_level must be a number")
     with db() as c:
+        bc_in = str(body.get("barcode", "")).strip()
+        if bc_in:
+            clash = c.execute(
+                "SELECT id, name FROM products WHERE barcode=? AND id<>?",
+                (bc_in, int(body.get("id") or 0))).fetchone()
+            if clash:
+                raise HTTPException(
+                    400, "条码已被商品「" + clash["name"] + "」使用"
+                    " / barcode already in use")
         if body.get("id"):
             pid = int(body["id"])
             old = c.execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone()
@@ -675,6 +749,7 @@ async def upsert_product(req: Request, authorization: str = Header(default="")):
                     (pid, float(body["stock_qty"]), float(body["stock_qty"]),
                      "opening", user["username"], now_iso()),
                 )
+    push_event({"type": "catalog"})
     return {"ok": True, "id": pid}
 
 
@@ -782,6 +857,15 @@ async def import_confirm(req: Request, authorization: str = Header(default="")):
                     skipped.append({"name": name, "reason": why})
                     continue
             else:
+                dupe = c.execute(
+                    "SELECT id FROM products WHERE is_active=1"
+                    " AND LOWER(TRIM(name))=LOWER(TRIM(?))",
+                    (name,)).fetchone()
+                if dupe:
+                    skipped.append({
+                        "name": name,
+                        "reason": "同名商品已存在且本行无条码，未重复创建"})
+                    continue
                 bc = _gen_barcode(c, taken)
                 generated = True
             taken.add(bc)
@@ -870,6 +954,30 @@ async def create_sale(req: Request, authorization: str = Header(default="")):
         trow = c.execute(
             "SELECT value FROM settings WHERE key='training_mode'").fetchone()
         training = bool(trow) and trow["value"] == "1"
+        # Idempotency: a retried checkout (network blip after the sale was
+        # recorded) carries the same client_ref and gets the original sale
+        # back instead of double-posting.
+        client_ref = str(body.get("client_ref", "")).strip()
+        if client_ref:
+            ex = c.execute("SELECT * FROM sales WHERE client_ref=?",
+                           (client_ref,)).fetchone()
+            if ex:
+                return {"ok": True, "id": ex["id"],
+                        "receipt_no": ex["receipt_no"],
+                        "total_cents": ex["total_cents"],
+                        "change_cents": ex["change_cents"],
+                        "rounding_cents": ex["rounding_cents"],
+                        "training": bool(ex["is_training"]),
+                        "duplicate": True}
+        bank_ref = str(body.get("bank_ref", "")).strip()
+        if bank_ref and not training:
+            dup = c.execute(
+                "SELECT id, receipt_no FROM sales WHERE bank_ref=?"
+                " AND is_void=0 AND is_training=0", (bank_ref,)).fetchone()
+            if dup:
+                raise HTTPException(
+                    409, "该到账已入账（" + dup["receipt_no"]
+                    + "），请勿重复结账 / bank ref already posted")
         subtotal = 0
         item_discounts = 0
         by_pid = {}
@@ -924,6 +1032,35 @@ async def create_sale(req: Request, authorization: str = Header(default="")):
                 raise HTTPException(400, "customer not found")
             cust_name = cu["name"]
             cust_phone = str(body.get("customer_phone") or cu["phone"] or "")
+        # Large discounts need a supervisor's PIN, verified here on the
+        # server (any active ADMIN) — the client-side prompt alone would
+        # be theatre. Threshold is a setting; default RM50.
+        total_discount = item_discounts + order_applied
+        if total_discount > 0:
+            thr_row = c.execute(
+                "SELECT value FROM settings"
+                " WHERE key='discount_pin_above_cents'").fetchone()
+            try:
+                pin_above = int(thr_row["value"]) if thr_row \
+                    and thr_row["value"] else 5000
+            except (TypeError, ValueError):
+                pin_above = 5000
+            if total_discount > pin_above:
+                apin = str(body.get("admin_pin", ""))
+                pin_ok = False
+                if apin:
+                    for a in c.execute(
+                            "SELECT pin_salt, pin_hash FROM users"
+                            " WHERE role='ADMIN' AND is_active=1").fetchall():
+                        if verify_pin(apin, a["pin_salt"], a["pin_hash"]):
+                            pin_ok = True
+                            break
+                if not pin_ok:
+                    raise HTTPException(
+                        403, "本单折扣共 RM"
+                        + f"{total_discount / 100:.2f}，超过 RM"
+                        + f"{pin_above / 100:.0f} 需要管理员 PIN"
+                        + " / admin PIN required for this discount")
         paid = _int_or_400(
             body.get("paid_cents", 0 if method == "CREDIT" else total),
             "paid_cents")
@@ -963,23 +1100,33 @@ async def create_sale(req: Request, authorization: str = Header(default="")):
             "discount_cents,total_cents,method,paid_cents,change_cents,"
             "bank_ref,created_at,is_training,deposit_method,customer_name,"
             "customer_phone,rounding_cents,item_discount_cents,"
-            "order_discount_cents)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "order_discount_cents,client_ref)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (receipt_no, user["username"], body.get("customer_id"), subtotal,
              item_discounts + order_applied, total, method, paid, change,
              str(body.get("bank_ref", "")), now_iso(), int(training),
              deposit_method, cust_name, cust_phone, rounding,
-             item_discounts, order_applied),
+             item_discounts, order_applied, client_ref),
         )
         sale_id = cur.lastrowid
         for p, qty, price, line_total, line_disc in lines:
+            if p["cost_cents"]:
+                unit_cost = int(p["cost_cents"])
+            elif c.execute(
+                    "SELECT 1 FROM purchase_items WHERE product_id=?"
+                    " LIMIT 1", (p["id"],)).fetchone():
+                unit_cost = 0
+            else:
+                # cost genuinely unknown -> NULL, so margin reports treat
+                # the line as uncovered instead of 100%-profit "covered"
+                unit_cost = None
             c.execute(
                 "INSERT INTO sale_items(sale_id,product_id,name,sku,qty,"
                 "unit_price_cents,line_total_cents,discount_cents,"
                 "unit_cost_cents)"
                 " VALUES(?,?,?,?,?,?,?,?,?)",
                 (sale_id, p["id"], p["name"], p["sku"], qty, price,
-                 line_total, line_disc, int(p["cost_cents"] or 0)),
+                 line_total, line_disc, unit_cost),
             )
             if not training:
                 new_qty = p["stock_qty"] - qty
@@ -990,6 +1137,24 @@ async def create_sale(req: Request, authorization: str = Header(default="")):
                     " VALUES(?,?,?,?,?,?)",
                     (p["id"], -qty, new_qty, "sale", receipt_no, now_iso()),
                 )
+        if bank_ref:
+            c.execute(
+                "INSERT INTO payment_claims(ref_no,username,created_at,sale_id)"
+                " VALUES(?,?,?,?) ON CONFLICT(ref_no) DO UPDATE SET"
+                " sale_id=excluded.sale_id",
+                (bank_ref, user["username"], now_iso(), sale_id))
+        if total_discount > 0:
+            # the discount audit trail is written by the server from the
+            # posted sale itself, so it cannot be skipped or forged by a
+            # client the way a voluntary /api/audit post could
+            c.execute(
+                "INSERT INTO audit_logs(occurred_at,username,role,action,"
+                "module,product_id,product_name,context,old_value,new_value,"
+                "reason) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (now_iso(), user["username"], user["role"],
+                 "order_discount" if order_applied else "line_discount",
+                 "pos", None, None, receipt_no, "",
+                 str(total_discount), "结账折扣（服务端记录）"))
     push_event({"type": "sale", "receipt_no": receipt_no})
     return {"ok": True, "id": sale_id, "receipt_no": receipt_no,
             "total_cents": total, "change_cents": change,
@@ -1056,8 +1221,16 @@ async def void_sale(sale_id: int, req: Request,
             raise HTTPException(400, "already void")
         # Original-parity: an admin may void any sale with a note; stock
         # is restored below and any credit repayment rows stay on record.
-        c.execute("UPDATE sales SET is_void=1, void_note=? WHERE id=?",
-                  (note, sale_id))
+        c.execute("UPDATE sales SET is_void=1, void_note=?, void_by=?,"
+                  " void_at=? WHERE id=?",
+                  (note, user["username"], now_iso(), sale_id))
+        c.execute(
+            "INSERT INTO audit_logs(occurred_at,username,role,action,module,"
+            "product_id,product_name,context,old_value,new_value,reason)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (now_iso(), user["username"], user["role"], "sale_void", "pos",
+             None, None, sale["receipt_no"], "", str(sale["total_cents"]),
+             note))
         if sale["is_training"]:
             return {"ok": True}
         for it in c.execute("SELECT * FROM sale_items WHERE sale_id=?", (sale_id,)):
@@ -1088,7 +1261,8 @@ def get_settings(authorization: str = Header(default="")):
 
 @app.post("/api/settings")
 async def post_settings(req: Request, authorization: str = Header(default="")):
-    require_admin(current_user(authorization))
+    user = current_user(authorization)
+    require_admin(user)
     body = await req.json()
     incoming = body.get("settings") or {}
     if "low_stock_threshold" in incoming:
@@ -1127,6 +1301,20 @@ async def post_settings(req: Request, authorization: str = Header(default="")):
         if k in incoming:
             incoming[k] = "1" if str(incoming[k]) in ("1", "true") else "0"
     with db() as c:
+        old_settings = {r["key"]: r["value"] for r in
+                        c.execute("SELECT key,value FROM settings")}
+        if "duitnow_qr_payload" in incoming and \
+                str(incoming["duitnow_qr_payload"]) != \
+                old_settings.get("duitnow_qr_payload", ""):
+            # the QR payload decides where the money lands: changing or
+            # clearing it needs the admin's own PIN re-entered, exactly
+            # like regenerating a barcode does
+            pin = str(body.get("admin_pin", ""))
+            if not pin or not verify_pin(pin, user["pin_salt"],
+                                         user["pin_hash"]):
+                raise HTTPException(
+                    403, "更改 DuitNow 收款码需要管理员本人 PIN"
+                    " / admin PIN required to change the DuitNow QR")
         for k, v in incoming.items():
             if k in SETTING_KEYS:
                 c.execute(
@@ -1134,6 +1322,23 @@ async def post_settings(req: Request, authorization: str = Header(default="")):
                     " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                     (k, str(v)),
                 )
+        for k in ("duitnow_qr_payload", "training_mode", "stock_policy",
+                  "discount_pin_above_cents", "low_stock_threshold"):
+            if k in incoming and k in SETTING_KEYS:
+                old_v = old_settings.get(k, "")
+                new_v = str(incoming[k])
+                if old_v != new_v:
+                    def _mask(x, key=k):
+                        return ("len=" + str(len(x)) + " " + x[:8]) \
+                            if key == "duitnow_qr_payload" else x
+                    c.execute(
+                        "INSERT INTO audit_logs(occurred_at,username,role,"
+                        "action,module,product_id,product_name,context,"
+                        "old_value,new_value,reason)"
+                        " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                        (now_iso(), user["username"], user["role"],
+                         "setting_change", "settings", None, None, k,
+                         _mask(old_v), _mask(new_v), ""))
     push_event({"type": "settings"})
     return {"ok": True}
 
@@ -1180,15 +1385,56 @@ async def scan_decode(req: Request, authorization: str = Header(default="")):
     return await _proxy_decode(await req.json())
 
 
+def _snapshot_db(tag):
+    """Full SQLite snapshot of the POS database (used before destructive
+    maintenance). Keeps the newest 10. Returns the path or None."""
+    try:
+        bdir = os.path.join(APP_DIR, "backups")
+        os.makedirs(bdir, exist_ok=True)
+        stamp = datetime.now(KL).strftime("%Y%m%d-%H%M%S")
+        dest = os.path.join(bdir, f"pos2-{tag}-{stamp}.db")
+        src_conn = sqlite3.connect(DB_PATH)
+        dst_conn = sqlite3.connect(dest)
+        try:
+            src_conn.backup(dst_conn)
+        finally:
+            dst_conn.close()
+            src_conn.close()
+        files = sorted(glob.glob(os.path.join(bdir, "pos2-*.db")))
+        for f in files[:-10]:
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+        return dest
+    except Exception:
+        return None
+
+
 # ------------------------------------------------- maintenance wipe ----
 @app.post("/api/admin/wipe")
 async def admin_wipe(req: Request, authorization: str = Header(default="")):
     """Go-live data wipe with checkbox categories + dry-run counts.
     Accounts and settings are never wiped."""
-    require_admin(current_user(authorization))
+    user = current_user(authorization)
+    require_admin(user)
     body = await req.json()
     cats = [str(x) for x in (body.get("categories") or [])]
     dry = bool(body.get("dry_run"))
+    snap_name = None
+    if not dry:
+        # wiping is irreversible: the admin re-enters their own PIN and
+        # the server snapshots the whole database first, every time
+        pin = str(body.get("pin", ""))
+        if not pin or not verify_pin(pin, user["pin_salt"],
+                                     user["pin_hash"]):
+            raise HTTPException(
+                403, "清零需要管理员本人 PIN / admin PIN required")
+        snap = _snapshot_db("pre-wipe")
+        if not snap:
+            raise HTTPException(
+                500, "清零前自动备份失败，已取消 / snapshot failed")
+        snap_name = os.path.basename(snap)
     counts = {}
 
     def _count(c, key, sql):
@@ -1251,6 +1497,10 @@ async def admin_wipe(req: Request, authorization: str = Header(default="")):
             c.execute("DELETE FROM barcode_queue")
         if "products" in cats:
             c.execute("DELETE FROM product_images")
+            c.execute("DELETE FROM supplier_product_aliases")
+            c.execute("DELETE FROM barcode_queue")
+            c.execute(
+                "UPDATE purchase_draft_lines SET matched_product_id=NULL")
             c.execute("DELETE FROM products")
         if "customers" in cats:
             c.execute("DELETE FROM customers")
@@ -1264,7 +1514,7 @@ async def admin_wipe(req: Request, authorization: str = Header(default="")):
             c.execute("UPDATE products SET stock_qty=0")
     push_event({"type": "sale"})
     push_event({"type": "settings"})
-    return {"ok": True, "counts": counts}
+    return {"ok": True, "counts": counts, "backup": snap_name}
 
 
 # ----------------------------------------------------- barcode queue ----
@@ -1502,7 +1752,9 @@ async def commit_draft(draft_id: int, req: Request,
         calc = sum(ln["line_subtotal_cents"] for ln in lines) \
             - d["discount_cents"] + d["tax_cents"] \
             + d["delivery_fee_cents"] + d["other_fee_cents"]
-        total = d["invoice_total_cents"] if d["invoice_total_cents"] is not None else calc
+        # the recorded total is what the lines add up to; the OCR-read
+        # invoice total is kept only as a cross-check in the audit log
+        total = calc
         purchase_no = (
             f"PO-{_next_seq(c, 'purchases:PO-', 'purchases', 'purchase_no', 'PO-'):04d}")
         cur = c.execute(
@@ -1544,9 +1796,10 @@ async def commit_draft(draft_id: int, req: Request,
             c.execute("UPDATE products SET stock_qty=?, cost_cents=? WHERE id=?",
                       (new_qty, unit_cost, p["id"]))
             c.execute(
-                "INSERT INTO stock_moves(product_id,delta,qty_after,reason,ref,created_at)"
-                " VALUES(?,?,?,?,?,?)",
-                (p["id"], stock_in, new_qty, "purchase", move_ref, now_iso()))
+                "INSERT INTO stock_moves(product_id,delta,qty_after,reason,ref,created_at,purchase_id)"
+                " VALUES(?,?,?,?,?,?,?)",
+                (p["id"], stock_in, new_qty, "purchase", move_ref, now_iso(),
+                 purchase_id))
             alias = (body.get("aliases") or {}).get(str(ln["id"]))
             if alias and d["supplier_id"]:
                 c.execute(
@@ -1568,7 +1821,8 @@ async def commit_draft(draft_id: int, req: Request,
             "username,action,details) VALUES(?,?,?,?,?,?)",
             (purchase_id, draft_id, now_iso(), user["username"],
              "ocr_purchase_committed",
-             f"invoice {inv} total {total}"))
+             f"invoice {inv} total {total}"
+             f" ocr_invoice_total {d['invoice_total_cents']}"))
         c.execute(
             "UPDATE purchase_drafts SET status='committed',"
             " committed_purchase_id=?, updated_at=? WHERE id=?",
@@ -1623,7 +1877,7 @@ def delete_alias(alias_id: int, authorization: str = Header(default="")):
 @app.get("/api/products/{product_id}/purchase-history")
 def purchase_history(product_id: int,
                      authorization: str = Header(default="")):
-    current_user(authorization)
+    require_admin(current_user(authorization))
     with db() as c:
         rows = c.execute(
             "SELECT pi.qty, pi.cost_cents, pu.created_at, pu.purchase_no"
@@ -1716,6 +1970,31 @@ async def create_held(req: Request, authorization: str = Header(default="")):
     payload = body.get("payload") or {}
     if not payload.get("items"):
         raise HTTPException(400, "empty cart")
+    # Rebuild the payload from typed fields only: a held order is rendered
+    # back into other users' pages, so nothing unvalidated may be stored.
+    clean_items = []
+    for it in payload.get("items") or []:
+        if not isinstance(it, dict):
+            raise HTTPException(400, "held item invalid")
+        try:
+            pid = int(it.get("product_id"))
+            qty = float(it.get("qty"))
+            price = int(it.get("price_cents") or 0)
+            idisc = int(it.get("discount_cents") or 0)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "held item invalid")
+        if not math.isfinite(qty) or qty <= 0 or qty > 1000000 \
+                or price < 0 or idisc < 0:
+            raise HTTPException(400, "held item invalid")
+        clean_items.append({
+            "product_id": pid, "name": str(it.get("name", ""))[:200],
+            "price_cents": price, "qty": qty, "discount_cents": idisc})
+    try:
+        order_disc = int(payload.get("discount_cents") or 0)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "held discount invalid")
+    payload = {"items": clean_items,
+               "discount_cents": max(0, order_disc)}
     with db() as c:
         hold_no = f"H-{_next_seq(c, 'held:H-', 'held_orders', 'hold_no', 'H-'):04d}"
         cur = c.execute(
@@ -1816,6 +2095,9 @@ async def repay_credit(sale_id: int, req: Request,
     amount = _int_or_400(body.get("amount_cents", 0), "amount_cents")
     if amount <= 0:
         raise HTTPException(400, "amount required")
+    repay_method = str(body.get("method", "CASH")).upper()
+    if repay_method not in ("CASH", "CARD", "DUITNOW"):
+        raise HTTPException(400, "还款方式无效 / invalid repay method")
     with db() as c:
         sale = c.execute("SELECT * FROM sales WHERE id=?", (sale_id,)).fetchone()
         if not sale or sale["method"] != "CREDIT" or sale["is_void"] \
@@ -1827,9 +2109,9 @@ async def repay_credit(sale_id: int, req: Request,
         c.execute("UPDATE sales SET paid_cents=? WHERE id=?",
                   (sale["paid_cents"] + amount, sale_id))
         c.execute(
-            "INSERT INTO credit_payments(sale_id,amount_cents,cashier,created_at)"
-            " VALUES(?,?,?,?)",
-            (sale_id, amount, user["username"], now_iso()),
+            "INSERT INTO credit_payments(sale_id,amount_cents,cashier,created_at,method)"
+            " VALUES(?,?,?,?,?)",
+            (sale_id, amount, user["username"], now_iso(), repay_method),
         )
     return {"ok": True, "remaining_cents": due - amount}
 
@@ -1882,6 +2164,7 @@ def delete_product(pid: int, authorization: str = Header(default="")):
             (pid,))
         if not cur.rowcount:
             raise HTTPException(404, "product not found")
+    push_event({"type": "catalog"})
     return {"ok": True}
 
 
@@ -1984,16 +2267,27 @@ async def create_purchase(req: Request, authorization: str = Header(default=""))
                                "cost_cents")
             if cost < 0:
                 raise HTTPException(400, "cost_cents must be >= 0")
+            if cost == 0 and p["cost_cents"] > 0:
+                # a blank/zero cost on the form means "unchanged" — it
+                # must never wipe a known cost back to zero
+                cost = p["cost_cents"]
             line_total = _line_total(cost, qty)
             total += line_total
             pid = p["id"]
             if pid in by_pid:
                 prev = by_pid[pid]
-                by_pid[pid] = (prev[0], prev[1] + qty, cost,
-                               prev[3] + line_total)
+                by_pid[pid] = (prev[0], prev[1] + qty,
+                               prev[2] + line_total)
             else:
-                by_pid[pid] = (p, qty, cost, line_total)
-        lines = list(by_pid.values())
+                by_pid[pid] = (p, qty, line_total)
+        lines = []
+        for p, qsum, asum in by_pid.values():
+            # merged duplicate lines take the weighted-average unit cost
+            # (previously the LAST line's cost was kept while the totals
+            # were summed, which corrupted both figures)
+            ucost = int((Decimal(asum) / Decimal(str(qsum))).quantize(
+                Decimal("1"), rounding=ROUND_HALF_UP)) if qsum else 0
+            lines.append((p, qsum, ucost, asum))
         cost_alerts = [a for a in (
             _cost_alert(p["name"], p["price_cents"], p["cost_cents"], cost)
             for p, _q, cost, _lt in lines) if a]
@@ -2028,10 +2322,10 @@ async def create_purchase(req: Request, authorization: str = Header(default=""))
             c.execute("UPDATE products SET stock_qty=?, cost_cents=? WHERE id=?",
                       (new_qty, cost, p["id"]))
             c.execute(
-                "INSERT INTO stock_moves(product_id,delta,qty_after,reason,ref,created_at)"
-                " VALUES(?,?,?,?,?,?)",
+                "INSERT INTO stock_moves(product_id,delta,qty_after,reason,ref,created_at,purchase_id)"
+                " VALUES(?,?,?,?,?,?,?)",
                 (p["id"], qty, new_qty, "purchase",
-                 invoice_no or f"PUR{purchase_id}", now_iso()),
+                 invoice_no or f"PUR{purchase_id}", now_iso(), purchase_id),
             )
     push_event({"type": "sale"})
     return {"ok": True, "id": purchase_id, "purchase_no": purchase_no,
@@ -2040,20 +2334,20 @@ async def create_purchase(req: Request, authorization: str = Header(default=""))
 
 @app.get("/api/purchases")
 def list_purchases(authorization: str = Header(default=""), limit: int = 100):
-    current_user(authorization)
+    require_admin(current_user(authorization))
     with db() as c:
         rows = c.execute(
             "SELECT pu.*, su.name supplier_name FROM purchases pu"
             " LEFT JOIN suppliers su ON su.id=pu.supplier_id"
             " ORDER BY pu.id DESC LIMIT ?",
-            (limit,),
+            (max(1, min(int(limit), 500)),),
         ).fetchall()
     return {"ok": True, "items": [dict(r) for r in rows]}
 
 
 @app.get("/api/purchases/{purchase_id}")
 def get_purchase(purchase_id: int, authorization: str = Header(default="")):
-    current_user(authorization)
+    require_admin(current_user(authorization))
     with db() as c:
         pur = c.execute(
             "SELECT pu.*, su.name supplier_name FROM purchases pu"
@@ -2099,10 +2393,18 @@ async def reverse_purchase(purchase_id: int, req: Request,
         for it in c.execute(
                 "SELECT * FROM purchase_items WHERE purchase_id=?",
                 (purchase_id,)):
-            move_ref = pur["invoice_no"] or f"PUR{purchase_id}"
             last_move = c.execute(
                 "SELECT MAX(id) m FROM stock_moves WHERE product_id=?"
-                " AND ref=?", (it["product_id"], move_ref)).fetchone()
+                " AND purchase_id=?",
+                (it["product_id"], purchase_id)).fetchone()
+            if not (last_move and last_move["m"] is not None):
+                # moves written before purchase_id existed: fall back to
+                # the ref match (an invoice number shared by two
+                # suppliers can still confuse this legacy path)
+                move_ref = pur["invoice_no"] or f"PUR{purchase_id}"
+                last_move = c.execute(
+                    "SELECT MAX(id) m FROM stock_moves WHERE product_id=?"
+                    " AND ref=?", (it["product_id"], move_ref)).fetchone()
             if last_move and last_move["m"] is not None:
                 later = c.execute(
                     "SELECT COUNT(*) n FROM stock_moves WHERE product_id=?"
@@ -2214,14 +2516,44 @@ def dashboard(authorization: str = Header(default="")):
             elif r["method"] == "DUITNOW":
                 duitnow += r["total_cents"]
             elif r["method"] == "CREDIT":
-                credit_today += r["total_cents"] - r["paid_cents"]
-                dm = r["deposit_method"]
-                if dm == "CASH":
-                    cash += r["paid_cents"]
-                elif dm == "CARD":
-                    card += r["paid_cents"]
-                elif dm == "DUITNOW":
-                    duitnow += r["paid_cents"]
+                # money buckets for credit are computed below from
+                # deposits + repayments; here it only counts toward
+                # sales_total (already added above)
+                pass
+        # Credit money for today must be split by WHEN it arrived:
+        # deposits belong to the sale's creation day (paid at the till,
+        # i.e. current paid_cents minus every repayment ever made on the
+        # sale, bucketed by deposit_method); repayments belong to the day
+        # they were received, bucketed by their own method. Counting the
+        # current paid_cents on creation day double-counts repayments.
+        dep_rows = c.execute(
+            "SELECT COALESCE(s.deposit_method,'CASH') dm,"
+            " COALESCE(SUM(s.paid_cents - COALESCE(rp.t,0)),0) dep,"
+            " COALESCE(SUM(s.total_cents - (s.paid_cents - COALESCE(rp.t,0))),0) new_credit"
+            " FROM sales s LEFT JOIN (SELECT sale_id,"
+            " SUM(amount_cents) t FROM credit_payments GROUP BY sale_id) rp"
+            " ON rp.sale_id=s.id WHERE s.is_void=0 AND s.is_training=0"
+            " AND s.method='CREDIT' AND substr(s.created_at,1,10)=?"
+            " GROUP BY dm", (day,)).fetchall()
+        credit_today = 0
+        for r in dep_rows:
+            credit_today += r["new_credit"]
+            if r["dm"] == "CASH":
+                cash += r["dep"]
+            elif r["dm"] == "CARD":
+                card += r["dep"]
+            elif r["dm"] == "DUITNOW":
+                duitnow += r["dep"]
+        for r in c.execute(
+                "SELECT method, COALESCE(SUM(amount_cents),0) t"
+                " FROM credit_payments WHERE substr(created_at,1,10)=?"
+                " GROUP BY method", (day,)).fetchall():
+            if r["method"] == "CASH":
+                cash += r["t"]
+            elif r["method"] == "CARD":
+                card += r["t"]
+            elif r["method"] == "DUITNOW":
+                duitnow += r["t"]
         credit_open = c.execute(
             "SELECT COALESCE(SUM(total_cents - paid_cents),0) t FROM sales"
             " WHERE is_void=0 AND is_training=0 AND method='CREDIT'"
@@ -2235,7 +2567,7 @@ def dashboard(authorization: str = Header(default="")):
 @app.get("/api/reports/summary")
 def report_summary(authorization: str = Header(default=""),
                    date_from: str = "", date_to: str = ""):
-    current_user(authorization)
+    require_admin(current_user(authorization))
     d_from = date_from or today_str()
     d_to = date_to or d_from
     with db() as c:
@@ -2282,7 +2614,7 @@ def report_monthly(authorization: str = Header(default=""),
     snapshot stored on each sale line; older lines without a snapshot
     are reported as uncovered, never guessed), new credit, repayments
     received and purchases for the month."""
-    current_user(authorization)
+    require_admin(current_user(authorization))
     mon = (month or today_str()[:7]).strip()
     try:
         datetime.strptime(mon, "%Y-%m")
@@ -2322,7 +2654,14 @@ def report_monthly(authorization: str = Header(default=""),
             " profit FROM sale_items si JOIN sales s ON s.id=si.sale_id"
             " WHERE s.is_void=0 AND s.is_training=0"
             " AND si.unit_cost_cents IS NOT NULL"
+            " AND si.unit_cost_cents > 0"
             " AND substr(s.created_at,1,10) BETWEEN ? AND ?",
+            (d_from, d_to)).fetchone()
+        adj = c.execute(
+            "SELECT COALESCE(SUM(order_discount_cents),0) od,"
+            " COALESCE(SUM(rounding_cents),0) rd FROM sales"
+            " WHERE is_void=0 AND is_training=0"
+            " AND substr(created_at,1,10) BETWEEN ? AND ?",
             (d_from, d_to)).fetchone()
         credit = c.execute(
             "SELECT COUNT(*) n, COALESCE(SUM(total_cents),0) credit_total"
@@ -2354,7 +2693,8 @@ def report_monthly(authorization: str = Header(default=""),
         "by_method": [dict(r) for r in methods],
         "by_day": [days[k] for k in sorted(days)],
         "top_products": [dict(r) for r in top],
-        "margin": {"profit_cents": margin["profit"],
+        "margin": {"profit_cents": margin["profit"]
+                   - (adj["od"] - adj["rd"]),
                    "covered_cents": margin["covered"]},
         "credit": {"sales_count": credit["n"],
                    "total_cents": credit["credit_total"],
@@ -2365,7 +2705,7 @@ def report_monthly(authorization: str = Header(default=""),
 
 @app.get("/api/closings")
 def list_closings(authorization: str = Header(default="")):
-    current_user(authorization)
+    require_admin(current_user(authorization))
     with db() as c:
         rows = c.execute(
             "SELECT business_date, closed_by, closed_at FROM daily_closings"
@@ -2376,7 +2716,7 @@ def list_closings(authorization: str = Header(default="")):
 
 @app.get("/api/closings/{business_date}")
 def get_closing(business_date: str, authorization: str = Header(default="")):
-    current_user(authorization)
+    require_admin(current_user(authorization))
     with db() as c:
         row = c.execute(
             "SELECT * FROM daily_closings WHERE business_date=?", (business_date,)
@@ -2394,6 +2734,10 @@ async def create_closing(req: Request, authorization: str = Header(default="")):
     require_admin(user)
     body = await req.json()
     day = str(body.get("business_date") or today_str())
+    try:
+        datetime.strptime(day, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(400, "business_date must be YYYY-MM-DD")
     counted = body.get("cash_counted_cents")
     if counted is not None:
         counted = _int_or_400(counted, "cash_counted_cents")
@@ -2423,10 +2767,14 @@ async def create_closing(req: Request, authorization: str = Header(default="")):
             " AND COALESCE(s.deposit_method,'CASH')='CASH'"
             " AND substr(s.created_at,1,10)=?",
             (day,)).fetchone()["t"]
-        repayments = c.execute(
-            "SELECT COALESCE(SUM(amount_cents),0) t FROM credit_payments"
-            " WHERE substr(created_at,1,10)=?", (day,)).fetchone()["t"]
-        cash_expected = cash_sales + credit_deposits + repayments
+        repay_by_method = {
+            r["method"]: r["t"] for r in c.execute(
+                "SELECT method, COALESCE(SUM(amount_cents),0) t"
+                " FROM credit_payments WHERE substr(created_at,1,10)=?"
+                " GROUP BY method", (day,)).fetchall()}
+        repayments = sum(repay_by_method.values())
+        repayments_cash = repay_by_method.get("CASH", 0)
+        cash_expected = cash_sales + credit_deposits + repayments_cash
         payload = {
             "business_date": day,
             "sales_count": grand["n"],
@@ -2436,7 +2784,9 @@ async def create_closing(req: Request, authorization: str = Header(default="")):
             "cash_breakdown_cents": {
                 "cash_sales": cash_sales,
                 "credit_deposits": credit_deposits,
-                "repayments": repayments,
+                "repayments": repayments_cash,
+                "repayments_by_method": repay_by_method,
+                "repayments_all": repayments,
             },
             "cash_counted_cents": counted,
             "cash_diff_cents": (counted - cash_expected)
@@ -2449,6 +2799,12 @@ async def create_closing(req: Request, authorization: str = Header(default="")):
             " closed_at=excluded.closed_at",
             (day, json.dumps(payload), user["username"], now_iso()),
         )
+        c.execute(
+            "INSERT INTO audit_logs(occurred_at,username,role,action,module,"
+            "product_id,product_name,context,old_value,new_value,reason)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (now_iso(), user["username"], user["role"], "day_close",
+             "reports", None, None, day, "", str(cash_expected), "日结"))
     return {"ok": True, "closing": payload}
 
 
@@ -2498,13 +2854,23 @@ def get_product_image(product_id: int, token: str = "",
 
 
 # --------------------------------------------------------- exports ----
+def _csv_safe(v):
+    s = str(v)
+    if s[:1] in ("=", "+", "@", "\t", "\r"):
+        return "'" + s
+    # "-5.00" is a legitimate negative amount; "-2+3" is a formula
+    if s[:1] == "-" and len(s) > 1 and not (s[1].isdigit() or s[1] == "."):
+        return "'" + s
+    return s
+
+
 def _csv_response(filename, header, rows):
     import csv
     import io
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow(header)
-    w.writerows(rows)
+    w.writerows([[_csv_safe(v) for v in row] for row in rows])
     return Response(
         content="﻿" + buf.getvalue(),
         media_type="text/csv; charset=utf-8",
@@ -2579,22 +2945,76 @@ def export_backup(authorization: str = Header(default="")):
     tables = ["users", "categories", "products", "customers", "suppliers",
               "sales", "sale_items", "stock_moves", "purchases",
               "purchase_items", "held_orders", "daily_closings", "settings",
-              "credit_payments"]
-    dump = {"exported_at": now_iso(), "tables": {}}
+              "credit_payments", "audit_logs", "barcode_queue",
+              "purchase_drafts", "purchase_draft_lines",
+              "supplier_product_aliases", "purchase_audit_log",
+              "product_images", "einvoice_status"]
+    # PIN hashes stay in the backup: without them a restore could not
+    # bring the accounts back. The file is admin-only — treat it like a
+    # password file.
+    dump = {"format": "pos2-backup-v2", "exported_at": now_iso(),
+            "tables": {}}
     with db() as c:
         for t in tables:
             rows = c.execute(f"SELECT * FROM {t}").fetchall()
-            data = [dict(r) for r in rows]
-            if t == "users":
-                for u in data:
-                    u.pop("pin_salt", None)
-                    u.pop("pin_hash", None)
-            dump["tables"][t] = data
+            dump["tables"][t] = [dict(r) for r in rows]
     return Response(
         content=json.dumps(dump, ensure_ascii=False, indent=1),
         media_type="application/json",
         headers={"Content-Disposition": 'attachment; filename="pos2-backup.json"'},
     )
+
+
+RESTORE_TABLES = [
+    "categories", "products", "product_images", "customers", "suppliers",
+    "sales", "sale_items", "stock_moves", "credit_payments", "purchases",
+    "purchase_items", "purchase_drafts", "purchase_draft_lines",
+    "supplier_product_aliases", "purchase_audit_log", "held_orders",
+    "daily_closings", "audit_logs", "barcode_queue", "einvoice_status",
+    "settings", "users",
+]
+
+
+@app.post("/api/admin/restore")
+async def admin_restore(req: Request,
+                        authorization: str = Header(default="")):
+    """Replace ALL data with a backup.json export. Admin + own PIN; the
+    current database is snapshotted first, and every session is killed
+    so all devices must log in again with the restored accounts."""
+    user = current_user(authorization)
+    require_admin(user)
+    body = await req.json()
+    pin = str(body.get("pin", ""))
+    if not pin or not verify_pin(pin, user["pin_salt"], user["pin_hash"]):
+        raise HTTPException(403, "还原需要管理员本人 PIN / admin PIN required")
+    backup = body.get("backup") or {}
+    tables = backup.get("tables") or {}
+    if not isinstance(tables, dict) or not tables.get("users"):
+        raise HTTPException(400, "备份无效：缺少用户表 / invalid backup")
+    snap = _snapshot_db("pre-restore")
+    if not snap:
+        raise HTTPException(500, "还原前自动备份失败，已取消 / snapshot failed")
+    with db() as c:
+        for t in RESTORE_TABLES:
+            rows = tables.get(t)
+            if rows is None:
+                continue
+            cols = [r[1] for r in c.execute(f"PRAGMA table_info({t})")]
+            c.execute(f"DELETE FROM {t}")
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                keys = [k for k in row.keys() if k in cols]
+                if not keys:
+                    continue
+                c.execute(
+                    f"INSERT INTO {t}({','.join(keys)})"
+                    f" VALUES({','.join('?' * len(keys))})",
+                    [row[k] for k in keys])
+        c.execute("DELETE FROM sessions")
+    push_event({"type": "settings"})
+    push_event({"type": "catalog"})
+    return {"ok": True, "backup_snapshot": os.path.basename(snap)}
 
 
 # ------------------------------------------------- payments / live ----
@@ -2660,6 +3080,54 @@ def list_payments(authorization: str = Header(default=""), limit: int = 300):
         "summary": {"today_cents": today, "month_cents": month,
                     "total_cents": total["s"], "total_count": total["n"]},
     }
+
+
+@app.post("/api/payments/claim")
+async def claim_payment(req: Request, authorization: str = Header(default="")):
+    """First device to claim a bank ref owns its auto-settle; every other
+    device is told the ref is taken so the same arrival is never posted
+    twice from two tills. Claims with no sale after 10 minutes lapse."""
+    user = current_user(authorization)
+    body = await req.json()
+    ref = str(body.get("ref_no", "")).strip()
+    if not ref:
+        raise HTTPException(400, "ref_no required")
+    with db() as c:
+        sold = c.execute(
+            "SELECT id FROM sales WHERE bank_ref=? AND is_void=0"
+            " AND is_training=0", (ref,)).fetchone()
+        if sold:
+            return {"ok": True, "claimed": False, "by": "posted"}
+        row = c.execute("SELECT * FROM payment_claims WHERE ref_no=?",
+                        (ref,)).fetchone()
+        if row:
+            if row["sale_id"]:
+                return {"ok": True, "claimed": False, "by": row["username"]}
+            age = (datetime.now(KL)
+                   - datetime.fromisoformat(row["created_at"])).total_seconds()
+            if age < 600 and row["username"] != user["username"]:
+                return {"ok": True, "claimed": False, "by": row["username"]}
+            c.execute("DELETE FROM payment_claims WHERE ref_no=?", (ref,))
+        c.execute(
+            "INSERT INTO payment_claims(ref_no,username,created_at)"
+            " VALUES(?,?,?)", (ref, user["username"], now_iso()))
+    return {"ok": True, "claimed": True}
+
+
+@app.post("/api/payments/release")
+async def release_payment(req: Request,
+                          authorization: str = Header(default="")):
+    """Give up a claim without posting (cashier said 'not this sale')."""
+    user = current_user(authorization)
+    body = await req.json()
+    ref = str(body.get("ref_no", "")).strip()
+    if not ref:
+        raise HTTPException(400, "ref_no required")
+    with db() as c:
+        c.execute(
+            "DELETE FROM payment_claims WHERE ref_no=? AND username=?"
+            " AND sale_id IS NULL", (ref, user["username"]))
+    return {"ok": True}
 
 
 @app.websocket("/api/ws")
@@ -2779,6 +3247,63 @@ def migrate():
         ):
             if col not in scols:
                 c.execute(f"ALTER TABLE sales ADD COLUMN {ddl}")
+        if "client_ref" not in scols:
+            c.execute("ALTER TABLE sales ADD COLUMN"
+                      " client_ref TEXT NOT NULL DEFAULT ''")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_sales_client_ref"
+                  " ON sales(client_ref)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_sales_created"
+                  " ON sales(created_at)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_sales_customer"
+                  " ON sales(customer_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_sale_items_sale"
+                  " ON sale_items(sale_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_stock_moves_product"
+                  " ON stock_moves(product_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_credit_payments_sale"
+                  " ON credit_payments(sale_id)")
+        smcols = [r[1] for r in c.execute("PRAGMA table_info(stock_moves)")]
+        if "purchase_id" not in smcols:
+            c.execute("ALTER TABLE stock_moves ADD COLUMN purchase_id INTEGER")
+        svcols = [r[1] for r in c.execute("PRAGMA table_info(sales)")]
+        for col, ddl in (
+            ("void_by", "void_by TEXT NOT NULL DEFAULT ''"),
+            ("void_at", "void_at TEXT NOT NULL DEFAULT ''"),
+        ):
+            if col not in svcols:
+                c.execute(f"ALTER TABLE sales ADD COLUMN {ddl}")
+        ei = c.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table'"
+            " AND name='einvoice_status'").fetchone()
+        if ei and "PRIMARY KEY(sale_id, environment)" not in ei[0]:
+            c.execute("""CREATE TABLE IF NOT EXISTS einvoice_status_new(
+                sale_id INTEGER NOT NULL,
+                receipt_no TEXT NOT NULL,
+                environment TEXT NOT NULL DEFAULT 'production',
+                status TEXT NOT NULL DEFAULT 'pending',
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(sale_id, environment))""")
+            c.execute(
+                "INSERT OR IGNORE INTO einvoice_status_new"
+                " SELECT sale_id, receipt_no, environment, status,"
+                " updated_at FROM einvoice_status")
+            c.execute("DROP TABLE einvoice_status")
+            c.execute(
+                "ALTER TABLE einvoice_status_new RENAME TO einvoice_status")
+        # Settings added after a database was first seeded never arrive
+        # via seed(); backfill their defaults here (existing values win).
+        for k, v in (("discount_pin_above_cents", "5000"),):
+            c.execute("INSERT OR IGNORE INTO settings(key,value)"
+                      " VALUES(?,?)", (k, v))
+        cpcols = [r[1] for r in c.execute("PRAGMA table_info(credit_payments)")]
+        if "method" not in cpcols:
+            c.execute("ALTER TABLE credit_payments ADD COLUMN"
+                      " method TEXT NOT NULL DEFAULT 'CASH'")
+        c.execute("""CREATE TABLE IF NOT EXISTS payment_claims(
+            ref_no TEXT PRIMARY KEY,
+            username TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT '',
+            sale_id INTEGER)""")
         icols = [r[1] for r in c.execute("PRAGMA table_info(sale_items)")]
         if "discount_cents" not in icols:
             c.execute("ALTER TABLE sale_items ADD COLUMN"
