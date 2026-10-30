@@ -17,8 +17,12 @@ for APK / IPA / EXE.
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r server/requirements.txt
 cp deploy/pos2.env.example pos2.env   # fill in real values
-POS2_ENV=pos2.env .venv/bin/python -m uvicorn server.main:app --port 8091
+set -a; . ./pos2.env; set +a          # the app reads plain env vars
+cd server && ../.venv/bin/python -m uvicorn main:app --port 8091
 ```
+The server must be started from inside `server/` (it imports its sibling
+modules by bare name). The env file is only auto-loaded by the systemd
+unit (`EnvironmentFile=`); for manual runs export the variables as above.
 (Production uses the systemd unit in `deploy/`.)
 
 First run seeds an admin and a staff account — see the seed section in
