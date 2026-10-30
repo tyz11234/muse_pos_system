@@ -42,6 +42,35 @@ for _field, _names in HEADER_ALIASES.items():
         _ALIAS_LOOKUP[_norm_header(_n)] = _field
 
 
+def _norm_num_str(s):
+    """Normalise a numeric string that may use either 1,234.56 or the
+    European 1.234,56 / 12,50 conventions. The old code simply deleted
+    every comma, which read 12,50 as 1250 (RM1,250 instead of RM12.50)."""
+    s = s.replace(" ", "")
+    if "," in s and "." in s:
+        if s.rfind(",") > s.rfind("."):
+            # 1.234,56 -> dots are thousands, comma is the decimal point
+            return s.replace(".", "").replace(",", ".")
+        # 1,234.56 -> commas are thousands
+        return s.replace(",", "")
+    if "," in s:
+        head, _, tail = s.rpartition(",")
+        if head.replace(",", "").isdigit() and len(tail) in (1, 2) \
+                and tail.isdigit() and s.count(",") == 1:
+            # 12,50 -> decimal comma
+            return head + "." + tail
+        return s.replace(",", "")
+    return s
+
+
+def _ean13_ok(code):
+    if len(code) != 13 or not code.isdigit():
+        return False
+    total = sum((1 if i % 2 == 0 else 3) * int(d)
+                for i, d in enumerate(code[:12]))
+    return (10 - total % 10) % 10 == int(code[12])
+
+
 def _money_to_cents(value):
     """Parse a money cell to integer cents; None when unparseable/empty."""
     if value is None:
@@ -52,9 +81,9 @@ def _money_to_cents(value):
         s = str(value).strip()
         if not s:
             return None
-        s = s.replace(",", "").replace(" ", "")
-        s = re.sub(r"^(rm|myr|¥|￥|\$)", "", s, flags=re.I)
+        s = re.sub(r"^(rm|myr|¥|￥|\$)", "", s.strip(), flags=re.I)
         s = re.sub(r"(rm|myr)$", "", s, flags=re.I)
+        s = _norm_num_str(s)
         if not s:
             return None
         try:
@@ -69,7 +98,7 @@ def _num(value):
         return None
     if isinstance(value, (int, float)):
         return float(value)
-    s = str(value).strip().replace(",", "")
+    s = _norm_num_str(str(value).strip())
     if not s:
         return None
     try:
@@ -140,11 +169,19 @@ def _rows_from_matrix(matrix):
         if stock < 0:
             errors.append(f"第 {line} 行（{name}）：库存不能为负，已跳过")
             continue
+        bc = _text(cell("barcode")).replace(" ", "")
+        if len(bc) == 12 and bc.isdigit() and _ean13_ok("0" + bc):
+            # Excel stored the EAN-13 as a number and ate the leading
+            # zero; it is recoverable only when the checksum proves it
+            warnings.append(
+                f"第 {line} 行（{name}）：条码被 Excel 存成数字丢失了"
+                f"前导 0，已按校验位还原为 0{bc}")
+            bc = "0" + bc
         rows.append({
             "name": name,
             "name_en": _text(cell("name_en")),
             "sku": _text(cell("sku")),
-            "barcode": _text(cell("barcode")).replace(" ", ""),
+            "barcode": bc,
             "category_name": _text(cell("category")),
             "unit": _text(cell("unit")) or "pcs",
             "price_cents": price,
